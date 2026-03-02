@@ -283,10 +283,14 @@ class Model(ABC):
         """
         self.usage_info_for_messages = usage_info
 
-    def _estimate_conversation_tokens(self) -> int:
-        """Rough estimate of current conversation size in tokens (chars / 4)."""
+    def _estimate_conversation_tokens(self, msgs: list[Any] | None = None) -> int:
+        """Rough estimate of conversation size in tokens (chars / 4).
+
+        Args:
+            msgs: Message list to estimate. Defaults to self.conversation.
+        """
         total_chars = 0
-        for msg in self.conversation:
+        for msg in (msgs if msgs is not None else self.conversation):
             content = msg.get("content", "")
             if isinstance(content, str):
                 total_chars += len(content)
@@ -296,58 +300,37 @@ class Model(ABC):
                         for v in block.values():
                             if isinstance(v, str):
                                 total_chars += len(v)
-        return total_chars // 4
+        return total_chars // 2
 
     def compact_conversation(self, max_context_tokens: int) -> None:
-        """Truncate old tool results and text to keep conversation within context limit.
+        """Drop old messages to keep conversation within half the context limit.
 
-        Preserves the system message, initial user prompt, and the most recent
-        messages while truncating content in older messages. Never modifies
-        thinking blocks (they have cryptographic signatures in Anthropic's API).
+        Preserves the initial user/human messages and keeps the last N messages,
+        decrementing N from 50 until the conversation fits within half the token
+        limit. Falls back to keeping only the initial messages if nothing fits.
 
         Args:
             max_context_tokens: The model's maximum context window in tokens.
         """
-        estimated = self._estimate_conversation_tokens()
-        if estimated < int(max_context_tokens * 0.7):
+        if self._estimate_conversation_tokens() <= int(max_context_tokens * 0.7):
             return
 
-        keep_start = 1
+        keep_start = 0
         for i, msg in enumerate(self.conversation):
             if msg.get("role") in ("user", "human"):
                 keep_start = i + 1
                 break
 
-        keep_recent = min(6, len(self.conversation))
-        if len(self.conversation) <= keep_start + keep_recent:
-            return
+        keep_recent = 30
+        while keep_recent > 0:
+            tail_start = max(keep_start, len(self.conversation) - keep_recent)
+            candidate = self.conversation[:keep_start] + self.conversation[tail_start:]
+            if self._estimate_conversation_tokens(candidate) <= max_context_tokens // 2:
+                self.conversation = candidate
+                return
+            keep_recent -= 1
 
-        cutoff = len(self.conversation) - keep_recent
-        trunc_marker = "\n...[truncated to save context]...\n"
-        max_len = 300
-
-        for msg in self.conversation[keep_start:cutoff]:
-            content = msg.get("content")
-            if msg.get("role") == "tool" and isinstance(content, str) and len(content) > max_len:
-                msg["content"] = content[:150] + trunc_marker + content[-100:]
-                continue
-            if isinstance(content, str) and len(content) > max_len:
-                msg["content"] = content[:150] + trunc_marker + content[-100:]
-            elif isinstance(content, list):
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    btype = block.get("type", "")
-                    if btype == "thinking":
-                        continue
-                    if btype == "tool_result":
-                        c = block.get("content", "")
-                        if isinstance(c, str) and len(c) > max_len:
-                            block["content"] = c[:150] + trunc_marker + c[-100:]
-                    elif btype == "text":
-                        t = block.get("text", "")
-                        if len(t) > max_len:
-                            block["text"] = t[:150] + trunc_marker + t[-100:]
+        self.conversation = self.conversation[:keep_start]
 
     # =========================================================================
     # Helper methods for building tool schemas (shared across implementations)
