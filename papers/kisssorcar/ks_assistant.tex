@@ -50,6 +50,7 @@ We present \textbf{KS Assistant}, a general-purpose assistant and integrated dev
 We implemented KS Assistant as a free, open-source Visual Studio Code extension that runs locally, is effective for long-horizon tasks, and supports browser automation, multimodal input, and Docker containers.  We deliberately prioritize output quality over speed: giving a frontier model adequate time to validate its own output---running linters, type checkers, and tests---dramatically reduces the low-quality code that plagues faster but less thorough agents.  The entire system was built using itself over four months, providing a continuous stress test in which any bug was patched immediately after its manifestation.  On Terminal-Bench~2.0, KS Assistant achieves a 62.2\% overall pass rate with Claude Opus~4.6~\citep{anthropic2026opus46}, comparing favorably to Claude~Code (58\%) and Cursor Composer~2 (61.7\%).  These results are achieved without benchmark-specific prompt tuning or model fine-tuning.
 \end{abstract}
 
+\vspace*{-3ex}
 %----------------------------------------------------------------------
 \section{Introduction}
 \label{sec:intro}
@@ -78,6 +79,7 @@ We evaluate on Terminal-Bench~2.0 and achieve a 62.2\% overall pass rate using C
 \paragraph{Outline.}
 Section~\ref{sec:architecture} presents the five-layer agent architecture.  Section~\ref{sec:evaluation} reports evaluation results on Terminal-Bench~2.0.  Section~\ref{sec:system-prompt} describes the two most distinctive aspects of the system prompt: the execution mindset and the web research protocol (the full prompt is detailed in Appendix~\ref{app:full-prompt}).  Section~\ref{sec:vscode-features} covers unique features of the VS~Code extension.  Section~\ref{sec:painless} demonstrates a ``painless'' natural-language development workflow drawn from the project's own history.  Section~\ref{sec:related} discusses related work, and Section~\ref{sec:conclusion} concludes.
 
+\vspace*{-3ex}
 %----------------------------------------------------------------------
 \section{Agent Architecture}
 \label{sec:architecture}
