@@ -458,7 +458,7 @@ We skip the description of the remaining 2 tasks in the paper in the interest of
 \section{Conclusion}
 \label{sec:conclusion}
 %----------------------------------------------------------------------
-\vspace*{-1ex}
+\vspace*{-2ex}
 
 We have shown that a simple layered, single-concern architecture can address the practical challenges of deploying LLM agents for real-world software development.  On Terminal-Bench~2.0, our system achieves a 62.2\% overall pass rate (277/445)---outperforming Claude~Code (58\%) and Cursor Composer~2 (61.7\%) on the same benchmark with the same underlying model (Claude Opus~4.6~\citep{anthropic2026opus46}).  These results are achieved without benchmark-specific optimizations, fine-tuning, or reinforcement learning.
 
@@ -466,7 +466,7 @@ We complement the architecture with a system prompt that encodes engineering dis
 
 In summary, we showed that a simple agent framework, without sophisticated agent technologies such as trajectory compaction and asynchronous multi-agent orchestration, was sufficient to build KS Assistant.  By building KS Assistant using itself and beating both the Cursor and Claude Code agents, we demonstrated that time-tested software engineering techniques and principles are invaluable for building reliable, practical agent systems.
 
-
+\vspace*{-2ex}
 \paragraph{Limitations.}  Our evaluation uses a single frontier model and benchmark; broader evaluation across open-weight models and benchmarks such as SWE-bench Pro is future work.  The continuation protocol's summaries may lose fidelity over many sub-sessions, and the quality-over-speed posture may not suit latency-sensitive workflows.
 
 %----------------------------------------------------------------------
