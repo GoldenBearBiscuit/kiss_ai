@@ -46,7 +46,7 @@
 \begin{abstract}
 Large language models can generate code and call tools with remarkable fluency, yet deploying them as practical software engineering assistants still exposes stubborn gaps: finite context windows, a single mistake that can derail entire sessions, agents that get stuck in dead ends, AI slop, and generated changes that are difficult to review or revert.
 
-We present \textbf{KS Assistant}, a general-purpose assistant and integrated development environment (IDE) built on top of the \textbf{KS Agent Framework}, a simple AI agent framework of roughly 1,900~lines of code for the core agents.  The framework addresses these gaps through a robust system prompt and a five-layer agent hierarchy in which each layer adds exactly one concern: budget-tracked ReAct execution, automatic continuation across sub-sessions via summarization, coding and browser tools with parallel sub-agents, persistent multi-turn chat with history recall, and git worktree isolation so every task runs on its own branch.  Both KS Assistant and the KS Agent Framework are grounded in disciplined software engineering practice; these principles are encoded directly into the agent's system prompt, enabling KS Assistant to write code that is simple, elegant, maintainable, and bug-free.
+We present \textbf{KS Assistant}, a general-purpose assistant and integrated development environment (IDE) built on top of the \textbf{KS Agent Framework}, a simple AI agent framework of roughly 1,900~lines of code for the core agents.  The framework addresses these gaps through a robust system prompt and a five-layer agent hierarchy in which each layer adds exactly one concern: budget-tracked ReAct execution, automatic continuation across sub-sessions via summarization, coding, and browser tools with parallel sub-agents, persistent multi-turn chat with history recall, and git worktree isolation so every task runs on its own branch.  Both KS Assistant and the KS Agent Framework are grounded in disciplined software engineering practice; these principles are encoded directly into the agent's system prompt, enabling KS Assistant to write code that is simple, elegant, maintainable, and bug-free.
 
 We implemented KS Assistant as a free, open-source Visual Studio Code extension that runs locally, is effective for long-horizon tasks, and supports browser automation, multimodal input, and Docker containers.  We deliberately prioritize output quality over speed: giving a frontier model adequate time to validate its own output---running linters, type checkers, and tests---dramatically reduces the low-quality code that plagues faster but less thorough agents.  The entire system was built using itself over four months, providing a continuous stress test in which any bug was patched immediately after its manifestation.  On Terminal-Bench~2.0, KS Assistant achieves a 62.2\% overall pass rate with Claude Opus~4.6~\citep{anthropic2026opus46}, comparing favorably to Claude~Code (58\%) and Cursor Composer~2 (61.7\%).  These results are achieved without benchmark-specific prompt tuning or model fine-tuning.
 \end{abstract}
@@ -137,15 +137,15 @@ Mean duration / trial    & 446\,s \\
 \end{tabular}
 \end{minipage}
 
-\textbf{Native function calling.}  Tools are registered as ordinary Python callables.  The agent builds an OpenAI-compatible tool schema once at setup time and caches it.  A special \texttt{finish} tool signals task completion and returns the result. Using a model's native calling API avoids the mistakes that models make on custom function calling conventions.
+\textbf{Native function calling.}  Tools are registered as ordinary Python callables.  The agent builds an OpenAI-compatible tool schema once at setup time and caches it.  A special \texttt{finish} tool signals task completion and returns the result. Using a model's native calling API avoids the mistakes models make with custom function-calling conventions.
 
-\textbf{Step, token, and budget tracking.}  At every step, the agent extracts input and output token counts from the API response, computes dollar cost using a per-model pricing table, and updates both local and global budget counters protected by a class-level lock.  Three limits are checked before each step: per-agent budget, global budget, and maximum step count.
+\textbf{Step, token, and budget tracking.}  At every step, the agent extracts input and output token counts from the API response, computes dollar cost using a per-model pricing table, and updates both local and global budget counters protected by a class-level lock.  Three limits are checked before each step: the per-agent budget, the global budget, and the maximum step count.
 
 \textbf{Error resilience.}  The agent retries transient API errors (rate limits, server errors) up to a configurable threshold.  Non-retryable errors (authentication failures, permission denials) are raised immediately.
 
 \textbf{Non-agentic mode.}  When tools are not needed, the agent runs a single generation without the ReAct loop, useful for summarization sub-tasks.
 
-Listing~\ref{lst:simple-agent} shows a complete, working agent in under ten lines of code.  The developer defines an ordinary Python function (\texttt{calculate}), instantiates a \texttt{KSAgent}, and calls its \texttt{run} method with a model name, a prompt template, template arguments, and a list of tools.  The framework automatically handles tool-schema generation, the ReAct loop, and budget tracking.
+Listing~\ref{lst:simple-agent} shows a complete, working agent in under ten lines of code.  The developer defines an ordinary Python function (\texttt{calculate}), instantiates a \texttt{KSAgent}, and calls its \texttt{run} method with a model name, a prompt template, template arguments, and a list of tools.  The framework automatically handles tool-schema generation, the ReAct loop, and budget tracking. 
 
 The KS Agent is stateless across runs: each call resets the conversation, token counters, and tool registry, making it safe to reuse a single instance for multiple sequential tasks.
 
@@ -156,11 +156,11 @@ The KS Agent is stateless across runs: each call resets the conversation, token 
 
 The Relentless Agent wraps a KS Agent in a continuation loop.  Its core contribution is executing tasks that exceed a single context window by breaking them into sub-sessions.
 
-Rather than investing in context-compaction techniques, we adopt a simple continuation protocol: when a sub-session exhausts its context window or step budget, the agent produces a \emph{structured summary} of every action taken so far---chronologically ordered, with explanations and relevant code snippets---and a fresh sub-session resumes from that summary.  This approach is related to Reflexion~\citep{shinn2023reflexion}, which feeds verbal self-critiques back into subsequent trials, but uses a Reflexion-like technique to \emph{continue} a task rather than retry it.  We found that a na\"ive instruction to ``summarize the current context'' produced poor continuations; requiring a \emph{step-by-step chronological account with code snippets} dramatically improved coherence across sub-sessions.  A potential limitation is that summaries may grow unwieldy for multi-day tasks; in practice, we have not encountered this problem even for tasks spanning several hours, but a thorough evaluation of summary scaling remains future work.
+Rather than investing in context-compaction techniques, we adopt a simple continuation protocol: when a sub-session exhausts its context window or step budget, the agent produces a \emph{structured summary} of every action taken so far---chronologically ordered, with explanations and relevant code snippets---and a fresh sub-session resumes from that summary.  This approach is related to Reflexion~\citep{shinn2023reflexion}, which feeds verbal self-critiques back into subsequent trials, but uses a Reflexion-like technique to \emph{continue} a task rather than retry it.  We found that a na\"ive instruction to ``summarize the current context'' produced poor continuations; requiring a \emph{step-by-step chronological account with code snippets} dramatically improved coherence across sub-sessions.  A potential limitation is that summaries may grow unwieldy for multi-day tasks; in practice, we have not encountered this problem even for tasks spanning several hours, but a thorough evaluation of summary scaling remains future work. 
 
 \textbf{Continuation protocol.}  The \texttt{finish} tool accepts three fields: a success flag, a continue flag, and a summary.  When \texttt{is\_continue=True}, the Relentless Agent starts a new sub-session with a fresh context window.  The prompt for the new session includes a chronologically ordered list of all prior attempt summaries, instructs the agent not to redo completed work, and advises it to step back and rethink the strategy from scratch if it has been retrying the same approach without progress.
 
-\textbf{Forced continuation on failure.}  If a sub-session raises an exception (e.g., the step limit is hit before calling finish), the Relentless Agent saves the full trajectory to a temporary file, spawns a separate summarizer agent to produce a concise summary, and uses that summary as the progress text for the next sub-session.  This ensures that even crashed sessions contribute useful context.  The summarizer is instructed to read the (potentially large) trajectory file and return a precise, chronologically-ordered list of things the agent did, with the reason for each action and relevant code snippets.
+\textbf{Forced continuation on failure.}  If a sub-session raises an exception (e.g., the step limit is hit before calling finish), the Relentless Agent saves the full trajectory to a temporary file, spawns a separate summarizer agent to produce a concise summary, and uses that summary as the progress text for the next sub-session.  This ensures that even crashed sessions contribute useful context.  The summarizer is instructed to read the (potentially large) trajectory file and return a precise, chronologically ordered list of the agent's actions, along with the reason for each action and relevant code snippets.
 
 \textbf{Pre-emptive continuation.}  To force the agent to self-continue before exhausting its step budget, the system prompt is augmented with a step-threshold instruction that requires the agent, at a designated step or whenever the task is at risk of running out of steps or context length, to call \texttt{finish} with \texttt{success=False}, \texttt{is\_continue=True}, and a precise chronologically-ordered summary of work done so far.  This instruction is injected near the end of the budget window.  Without it, the agent exhibits a ``rush to finish'' behavior when steps are running low---skipping verification, making hasty edits, and calling \texttt{finish} with an incomplete result.  The explicit step threshold redirects that urgency into the continuation protocol, ensuring that a clean handoff to a new sub-session produces better results than a frantic attempt to squeeze everything into the remaining steps.
 
@@ -175,7 +175,7 @@ The Tool Agent adds the tools that make the system useful for software developme
 
 \textbf{Browser automation.}  A web-use tool provides programmatic browser control: navigating to URLs, reading page accessibility trees, clicking elements, typing text, pressing keys, scrolling, and taking screenshots.  It uses the open-source Chromium browser via the Playwright library.
 
-\textbf{Parallel sub-agents.}  An optional parallel execution tool spawns independent Tool Agent instances in a thread pool.  Each sub-agent gets its own LLM context and tool set, useful for embarrassingly parallel tasks such as summarizing multiple files or researching independent topics.  Results are collected and returned in input order.  This tool is not activated by default because the IDE cannot stream multiple agent outputs coherently in the chat window.
+\textbf{Parallel sub-agents.}  An optional parallel execution tool spawns independent Tool Agent instances in a thread pool.  Each sub-agent gets its own LLM context and tool set, useful for embarrassingly parallel tasks such as summarizing multiple files or researching independent topics.  Results are collected and returned in input order.  This tool is not enabled by default because the IDE cannot coherently stream multiple agents' outputs in the chat window.
 
 \textbf{User interaction.}  An ask-user-question tool pauses execution and requests clarification from the user.
 
@@ -205,7 +205,7 @@ The Chat Agent adds multi-turn conversation persistence.
 
 The Worktree Agent is the outermost layer.  Its defining feature is git-worktree isolation.
 
-\textbf{Branch-per-task.}  When a task starts, the agent creates a new git branch and corresponding worktree directory.  All agent modifications happen inside the worktree; the user's main working tree remains untouched.
+\textbf{Branch-per-task.}  When a task starts, the agent creates a new git branch and a corresponding worktree directory.  All agent modifications happen inside the worktree; the user's main working tree remains untouched.
 
 \textbf{Dirty-state preservation.}  Uncommitted changes in the main working tree are copied into the worktree with a baseline commit.  During merge, cherry-pick from the baseline replays only the agent's changes.
 
@@ -220,7 +220,7 @@ The Worktree Agent is the outermost layer.  Its defining feature is git-worktree
 \label{sec:evaluation}
 %----------------------------------------------------------------------
 
-We evaluate on Terminal-Bench~2.0,\footnote{\url{https://www.tbench.ai/}} a benchmark comprising 89 diverse terminal-based programming tasks, ranging from building legacy compilers and configuring servers to solving cryptanalysis challenges and training machine-learning models.  Each task runs in an isolated Docker container; a separate verifier automatically judges the result.  We use the Harbor\footnote{\url{https://github.com/harbor-framework/harbor}} framework to orchestrate execution and Claude Opus~4.6~\citep{anthropic2026opus46} as the underlying LLM.  We do not modify the general system prompt or inject benchmark-specific instructions.  Evaluation was carried out on a 2025 MacBook Air 15'' with an M4 processor and 24\,GB RAM.
+We evaluate on Terminal-Bench~2.0,\footnote{\url{https://www.tbench.ai/}} a benchmark comprising 89 diverse terminal-based programming tasks, ranging from building legacy compilers and configuring servers to solving cryptanalysis challenges and training machine-learning models.  Each task runs in an isolated Docker container; a separate verifier automatically judges the result.  We use the Harbor\footnote{\url{https://github.com/harbor-framework/harbor}} framework to orchestrate execution and Claude Opus~4.6~\citep{anthropic2026opus46} as the underlying LLM.  We do not modify the general system prompt or inject benchmark-specific instructions.  Evaluation was carried out on a 2025 MacBook Air 15'' with an M4 processor and 24\, GB RAM.
 
 \subsection{Setup}
 
@@ -247,7 +247,7 @@ The 62.2\% overall pass rate compares favorably to other agents using the same u
 \label{sec:system-prompt}
 %----------------------------------------------------------------------
 
-The system prompt is a structured document that governs the agent's behavior across all tasks.  It is not a generic instruction to ``be helpful'' but rather a precise specification of engineering discipline.  We present the two most distinctive aspects here; the complete prompt is detailed in Appendix~\ref{app:full-prompt}.
+The system prompt is a structured document that governs the agent's behavior across all tasks.  It is not a generic instruction to ``be helpful'' but rather a precise specification of an engineering discipline.  We present the two most distinctive aspects here; the complete prompt is detailed in Appendix~\ref{app:full-prompt}.
 
 
 %......................................................................
@@ -279,7 +279,7 @@ The prompt opens with two directives that set the tone for the entire session:
 \textbf{``NO AI SLOP.''}  ``AI slop'' refers to the low-quality, generic, hedging text that LLMs produce when they lack confidence: filler phrases like ``certainly!'', unnecessary caveats, and boilerplate explanations.  This directive encourages the model to be concise and substantive.
 
 \medskip
-\noindent These two sentences occupy only two lines, yet they establish a behavioral contract that permeates every subsequent interaction.  We observe that removing any single directive degrades the agent's behavior along the corresponding dimension while developing KS Assistant (e.g., removing ``BE RELENTLESS'' causes the agent to give up after the first error more frequently).
+\noindent These two sentences occupy only two lines, yet they establish a behavioral contract that permeates every subsequent interaction.  We observe that removing any single directive degrades the agent's behavior along the corresponding dimension during KS Assistant development (e.g., removing ``BE RELENTLESS'' causes the agent to give up after the first error more frequently).
 
 %......................................................................
 \subsection{Web research protocol}
@@ -291,14 +291,14 @@ When the agent needs external knowledge, the prompt prescribes a structured rese
 \begin{prompt}
 ## Web Research (MANDATORY)
 
-- **Visit >=30 websites every search. Hard requirement---don't stop before 30 or rationalize fewer.**
+- **Visit >=30 websites every search. Hard requirement — don't stop before 30, or rationalize fewer.**
 - Procedure:
   1. Create PWD/tmp/information-{unique_id}.md: `# Web Research --- Websites visited: 0/30`
-  1. Per site, append: `## [N/30] URL` + extracted info. Update header counter each visit.
+  1. Per site, append: `## [N/30] URL` + extracted info. Update the header counter on each visit.
   1. **Don't proceed until counter >=30.**
   1. If results dry up, try different queries, synonyms, official docs, GitHub repos/issues, Stack Overflow, blogs, Reddit, papers, API refs.
   1. After 30, review and think deeply.
-- Ask user for login help when needed.
+- Ask the user for login help when needed.
 \end{prompt}
 
 \noindent The rationale is a two-phase separation between \emph{collection} and \emph{synthesis}.  LLMs tend to anchor on the first few results they encounter, biasing their solutions toward a narrow slice of the design space.  By forcing the agent to accumulate a broad set of information into a file \emph{before} reasoning about it, the protocol counteracts anchoring bias and encourages the model to consider diverse approaches. The ``visit $\geq$30 websites'' threshold is deliberately aggressive: it ensures the agent does not shortcut the research phase after two or three hits, and the resulting information file serves as an auditable artifact of what the agent considered.  
@@ -327,7 +327,7 @@ We release our system as a VS~Code extension and a web app.  While the underlyin
 \label{sec:painless}
 %----------------------------------------------------------------------
 
-A central claim of our system is that natural-language interaction can replace manual code inspection and ad hoc scripting for understanding and evolving nontrivial subsystems.  While developing KS Assistant, we found a particular workflow to be useful.  In the workflow, we first ask KS Assistant to generate a detailed, step-by-step description of a workflow or algorithm we found buggy, and then we ask KS Assistant to revise some of the buggy steps in natural language.  We illustrate this with a real development session drawn from the project's own history, in which the worktree merge workflow (Section~\ref{sec:worktree-agent}) was first understood and then redesigned entirely through conversational prompts.  The session comprises four consecutive tasks; we reproduce the prompts verbatim and summarize the agent's responses.
+A central claim of our system is that natural-language interaction can replace manual code inspection and ad hoc scripting to understand and evolve nontrivial subsystems.  While developing KS Assistant, we found a particular workflow to be useful.  In the workflow, we first ask KS Assistant to generate a detailed, step-by-step description of a workflow or algorithm we found buggy, and then we ask KS Assistant to revise some of the buggy steps in natural language.  We illustrate this with a real development session drawn from the project's own history, in which the worktree merge workflow (Section~\ref{sec:worktree-agent}) was first understood and then redesigned entirely through conversational prompts.  The session comprises four consecutive tasks; we reproduce the prompts verbatim and summarize the agent's responses.
 
 \paragraph{Step~1: Understanding the existing workflow.} The developer begins by asking the agent to explain the current post-task git lifecycle:
 
@@ -341,8 +341,8 @@ Can you tell me what happens, step by step, with git in worktree_sorcar_agent.py
 
 \begin{prompt}
 Can you change worktree_sorcar_agent.py and the extension so that after the agent 
-finishes its task, it simply asks "Commit and Merge" or "Discard". When "Commit 
-and Merge" is clicked by the user, the agent must commit the changes with a 
+finishes its task, it simply asks "Commit and Merge" or "Discard"? When "Commit 
+When " Merge" is clicked by the user, the agent must commit the changes with a 
 generated commit message, merge the branch with the original branch, and delete 
 the worktree and the branch associated with the worktree. If the user clicks 
 "discard", it must delete the worktree and the branch, and checkout the 
@@ -351,7 +351,7 @@ original branch.
 
 \noindent The agent modifies six files across Python and TypeScript: it updates \texttt{discard()} to check out the original branch before deleting the task branch, removes the \texttt{manual\_merge()} method entirely, simplifies \texttt{merge\_instructions()} to show only two options, updates the webview UI to replace the three-button toolbar with a two-button ``Commit and Merge or Discard?'' bar, removes the \texttt{manual} action type from the TypeScript type definitions, and removes the corresponding handler from the Python backend.  Three tests for the deleted manual-merge path have been removed, and one routing test has been updated.  All 28 worktree tests pass after the change.
 
-We skip the description of the remaining 2 tasks in the paper in the interest of space, but they can be found in the Appendix.
+We skip the description of the remaining 2 tasks in the paper for space reasons, but they can be found in the Appendix.
 
 % \paragraph{Step~3: Investigating unexpected post-merge state.} After testing the simplified flow, the developer notices that files appear in the Source Control panel of VS~Code on the original branch after pressing ``Commit and Merge'' and asks:
 
@@ -388,14 +388,14 @@ We skip the description of the remaining 2 tasks in the paper in the interest of
 
 \textbf{Agent frameworks.}  LangChain~\citep{langchain2022}, DSPy~\citep{khattab2024dspy}, CrewAI~\citep{crewai2024}, smolagents~\citep{smolagents2025}, the OpenAI Agents SDK~\citep{openaiagentssdk2025}, and Google's ADK~\citep{googleadk2025} provide general-purpose agent infrastructure.  Our architecture is purpose-built for software engineering, with each layer addressing a specific practical concern.
 
-\textbf{Benchmarks, agentic SE, and self-improvement.}  SWE-bench~\citep{jimenez2024swebench}, HumanEval~\citep{chen2021evaluating}, LiveCodeBench~\citep{jain2024livecodebench}, and SWE-bench Pro~\citep{deng2025swebenchpro} evaluate coding agents at various scales; \citet{prathifkumar2025swebenchverified} raises concerns about benchmark contamination.  Recent surveys and studies articulate the pillars of agentic software engineering, autonomous coding agents, agentic programming, agent context files, and context engineering~\citep{hassan2025agentic,li2025rise,wang2025agentic,chatlatanagulchai2025readmes,mohsenimofidi2025context}; our system prompt and per-repository override mechanisms instantiate these context-engineering patterns.  \citet{robeyns2025selfimproving} demonstrates a self-improving coding agent; our self-improvement loop is a lighter-weight form via accumulated preferences.  \citet{gao2025trae} applies test-time compute scaling to software engineering, and Get Shit Done~\citep{gsd2025} is a meta-prompting system for coding agents addressing context rot through phased planning documents that inspired parts of our system prompt.
+\textbf{Benchmarks, agentic SE, and self-improvement.}  SWE-bench~\citep{jimenez2024swebench}, HumanEval~\citep{chen2021evaluating}, LiveCodeBench~\citep{jain2024livecodebench}, and SWE-bench Pro~\citep{deng2025swebenchpro} evaluate coding agents at various scales; \citet{prathifkumar2025swebenchverified} raises concerns about benchmark contamination.  Recent surveys and studies articulate the pillars of agentic software engineering, autonomous coding agents, agentic programming, agent context files, and context engineering~\citep{hassan2025agentic,li2025rise,wang2025agentic,chatlatanagulchai2025readmes,mohsenimofidi2025context}; our system prompt and per-repository override mechanisms instantiate these context-engineering patterns.  \citet{robeyns2025selfimproving} demonstrates a self-improving coding agent; our self-improvement loop is a lighter-weight form based on accumulated preferences.  \citet{gao2025trae} applies test-time compute scaling to software engineering, and Get Shit Done~\citep{gsd2025} is a meta-prompting system for coding agents that addresses context rot through phased planning documents, which inspired parts of our system prompt.
 
 %----------------------------------------------------------------------
 \section{Conclusion}
 \label{sec:conclusion}
 %----------------------------------------------------------------------
 
-A simple layered, single-concern architecture combined with a system prompt that encodes engineering discipline addresses the practical challenges of deploying LLM agents for real-world software development.  On Terminal-Bench~2.0, our system reaches 62.2\% (277/445), outperforming Claude~Code (58\%) and Cursor Composer~2 (61.7\%) on the same benchmark and base model~\citep{anthropic2026opus46} without benchmark-specific tuning, fine-tuning, or reinforcement learning.  Time-tested software engineering principles, expressed as concrete instructions an LLM can follow, matter more than model-level customization for building reliable, practical agent systems.
+A simple, layered, single-concern architecture, combined with a system prompt that encodes engineering discipline, addresses the practical challenges of deploying LLM agents for real-world software development.  On Terminal-Bench~2.0, our system reaches 62.2\% (277/445), outperforming Claude~Code (58\%) and Cursor Composer~2 (61.7\%) on the same benchmark and base model~\citep{anthropic2026opus46} without benchmark-specific tuning, fine-tuning, or reinforcement learning.  Time-tested software engineering principles, expressed as concrete instructions an LLM can follow, matter more than model-level customization for building reliable, practical agent systems.
 
 \textbf{Limitations.}  Our evaluation uses a single model and benchmark; broader evaluation, especially on benchmarks like SWE-bench Pro, is future work.  Continuation summaries may lose fidelity, and our quality-over-speed posture may not suit latency-sensitive workflows.
 
@@ -429,7 +429,7 @@ Tool usage rules are explicit and mechanical:
 # Rules
 
 - PWD = current working directory. Write() for new files; Edit() for small changes.
-- Run Bash synchronously with `timeout_seconds` (default 300s). Retry with higher timeout on timeout. For >10 min commands, run in background, redirect output to file, poll periodically.
+- Run Bash synchronously with `timeout_seconds` (default 300s). Retry with a higher timeout on timeout. For >10 min commands, run in the background, redirect output to a file, and poll periodically.
 - Use go_to_url() for browser. Search the internet extensively.
 - **User only sees the finish() summary. Include full details/results/outputs. Never include meta-descriptions like "Answered the user's question about X" or "Fixed the bug in Y".**
 - Read large files in chunks. Temp files in PWD/tmp; clean up after.
@@ -537,12 +537,12 @@ The complexity threshold---three or more files---avoids the overhead of planning
 ## Testing
 
 - Run lint/typecheckers; fix all errors. Achieve 100% branch coverage. Every error, including pre-existing ones, is yours---don't skip.
-- NO mocks, patches, fakes, or test doubles. Write integration/e2e tests. Each test independent, verifying actual behavior.
+- NO mocks, patches, fakes, or test doubles. Write integration/e2e tests. Each test is independent, verifying actual behavior.
 - **Only run impacted tests after modifications.**
 - To confirm races: add random sleep (<0.1s) before racing statements.
 \end{prompt}
 
-The most opinionated rule is the no-mocks requirement.  Mock tests verify that code calls certain methods in a certain order---they test the implementation, not the behavior.  A test suite built on mocks can pass with flying colors while the system is fundamentally broken.  Integration tests that exercise actual behavior provide genuine confidence that the system works.  The clause ``Every error, including pre-existing ones, is yours---don't skip'' makes the agent responsible for the entire codebase health, not just the delta it introduced.
+The most opinionated rule is the no-mocks requirement.  Mock tests verify that code calls certain methods in a certain order---they test the implementation, not the behavior.  A test suite built on mocks can pass with flying colors while the system is fundamentally broken.  Integration tests that exercise actual behavior provide genuine confidence that the system works.  The clause ``Every error, including pre-existing ones, is yours---don't skip'' makes the agent responsible for the entire codebase's health, not just the delta it introduced.
 
 %......................................................................
 \subsection{Self-improvement loop}
@@ -557,7 +557,7 @@ The agent maintains a preferences file that captures user invariants discovered 
 Read PWD/USER_PREFS.md at task start. Update with user preferences/invariants (no code snippets/symbols; skip one-off tasks). Remove conflicting old entries carefully and thoroughly.
 \end{prompt}
 
-This mechanism allows the agent to accumulate project knowledge over time without requiring the user to repeat themselves.  The conflict-resolution clause mandates that the agent actively resolves contradictions when updating the file.  The prohibition on code snippets and symbols keeps the file compact and robust to code changes; the one-off task exclusion prevents preference drift from idiosyncratic details.
+This mechanism allows the agent to accumulate project knowledge over time without requiring the user to repeat themselves.  The conflict-resolution clause mandates that the agent actively resolve contradictions when updating the file.  The prohibition on code snippets and symbols keeps the file compact and robust against code changes; the one-off task exclusion prevents preference drift due to idiosyncratic details.
 
 %......................................................................
 \subsection{Pre-finish verification}
@@ -573,7 +573,7 @@ Before finish(success=True):
 1. Run required checks (lint, typecheck, tests); fix failures.
 1. Check each user requirement against delivery.
 1. If any check fails, keep working.
-1. After 3 failed retries of same fix, rethink from scratch.
+1. After 3 failed retries of the same fix, rethink from scratch.
 \end{prompt}
 
 The three-retry threshold forces the model to break out of repetitive loops by abandoning the current approach and reconsidering the problem from first principles.
@@ -589,7 +589,7 @@ The three-retry threshold forces the model to break out of repetitive loops by a
 Collect info and code snippets in PWD/tmp/file-information-{unique_id}.md without overthinking, then review and think deeply.
 \end{prompt}
 
-This instruction applies the same two-phase collect-then-synthesize discipline used for web research (Section~\ref{sec:web-research}) to the local file system.  By writing a structured summary of each file's relevant information into a temporary markdown file, the agent externalizes its understanding into a compact artifact that is typically much smaller than the raw source files, freeing up context window capacity for subsequent reasoning and editing.
+This instruction applies the same two-phase collect-then-synthesize discipline used for web research (Section~\ref{sec:web-research}) to the local file system.  By writing a structured summary of each file's relevant information to a temporary markdown file, the agent externalizes its understanding as a compact artifact, typically much smaller than the raw source files, freeing up context window capacity for subsequent reasoning and editing.
 
 %......................................................................
 \section{Painless software engineering (continued)}
@@ -840,7 +840,7 @@ to review the modified and new files in the original branch. Fix it.
     \end{itemize}
 
 \item {\bf Declaration of LLM usage}
-    \item[] Question: Does the paper describe the usage of LLMs if it is an important, original, or non-standard component of the core methods in this research? Note that if the LLM is used only for writing, editing, or formatting purposes and does \emph{not} impact the core methodology, scientific rigor, or originality of the research, declaration is not required.
+    \item[] Question: Does the paper describe the usage of LLMs if it is an important, original, or non-standard component of the core methods in this research? Note that if the LLM is used only for writing, editing, or formatting purposes and does \emph{not} impact the core methodology, scientific rigor, or originality of the research, a declaration is not required.
     \item[] Answer: \answerYes{}
     \item[] Justification: The entire system is built around LLM usage. Section~\ref{sec:architecture} describes how LLMs are used as the core reasoning engine via native function calling (Section~\ref{sec:ks-agent}). The paper also discloses that the system was built using itself (Section~\ref{sec:intro}).
     \item[] Guidelines:
