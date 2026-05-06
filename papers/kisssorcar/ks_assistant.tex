@@ -395,7 +395,7 @@ We skip the description of the remaining 2 tasks in the paper for space reasons,
 \label{sec:conclusion}
 %----------------------------------------------------------------------
 
-A simple, layered, single-concern architecture, combined with a system prompt that encodes engineering discipline, addresses the practical challenges of deploying LLM agents for real-world software development.  On Terminal-Bench~2.0, our system reaches 62.2\% (277/445), outperforming Claude~Code (58\%) and Cursor Composer~2 (61.7\%) on the same benchmark and base model~\citep{anthropic2026opus46} without benchmark-specific tuning, fine-tuning, or reinforcement learning.  Time-tested software engineering principles, expressed as concrete instructions an LLM can follow, matter more than model-level customization for building reliable, practical agent systems.
+A simple, layered, single-concern architecture, combined with a system prompt that encodes engineering discipline, addresses the practical challenges of deploying LLM agents for real-world software development.  On Terminal-Bench~2.0, our system reaches 62.2\% (277/445), outperforming Claude~Code (58\%) and Cursor Composer~2 (61.7\%) on the same benchmark and base model~\citep{anthropic2026opus46} without benchmark-specific tuning, fine-tuning, or reinforcement learning.  Time-tested software engineering principles, expressed as concrete instructions an LLM can follow, matter more than model-level customization for building reliable, practical agent systems.  By building KS Assistant using itself and matching or beating both the Cursor and Claude Code agents, we demonstrate that time-tested software engineering principles and techniques are invaluable for building reliable, practical agent systems.
 
 \textbf{Limitations.}  Our evaluation uses a single model and benchmark; broader evaluation, especially on benchmarks like SWE-bench Pro, is future work.  Continuation summaries may lose fidelity, and our quality-over-speed posture may not suit latency-sensitive workflows.
 
@@ -795,7 +795,7 @@ to review the modified and new files in the original branch. Fix it.
 \item {\bf Claims}
     \item[] Question: Do the main claims made in the abstract and introduction accurately reflect the paper's contributions and scope?
     \item[] Answer: \answerYes{}
-    \item[] Justification: The abstract and introduction (Section~\ref{sec:intro}) clearly state the contributions---a five-layer agent architecture, a structured system prompt, a VS~Code extension, and a 62.2\% pass rate on Terminal-Bench~2.0---and the scope is limited to software engineering tasks.
+    \item[] Justification: The abstract and introduction (Section~\ref{sec:intro}) clearly state the contributions---a five-layer agent architecture, a structured system prompt, a VS~Code extension, and a 62.2\% pass rate on Terminal-Bench~2.0---and the scope is limited to software engineering tasks.  The conclusion's claim that KS~Assistant matches or beats both the Cursor Composer~2 and Claude~Code agents is directly supported by the head-to-head Terminal-Bench~2.0 results in Section~\ref{sec:evaluation} (62.2\% vs.\ 61.7\% and 58\%, on the same benchmark and base model), and the claim that KS~Assistant was built using itself is documented in Section~\ref{sec:intro} and discussed throughout Sections~\ref{sec:architecture}--\ref{sec:evaluation}.
     \item[] Guidelines:
     \begin{itemize}
         \item The answer \answerNA{} means that the abstract and introduction do not include the claims made in the paper.
