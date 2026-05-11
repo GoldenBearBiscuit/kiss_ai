@@ -92,7 +92,7 @@ The name ``KISS'' reflects the \emph{Keep It Simple, Stupid} design philosophy i
 
 We implement KISS Sorcar, a general-purpose assistant and an integrated development environment (IDE), on top of the KISS Agent Framework.  KISS Sorcar is a Visual Studio Code extension that runs locally. It has browser support (using open-source Chromium and Playwright), multimodal support, Docker container support, OpenClaw-like features (whose discussion is beyond the scope of the paper), and a mobile/web app. KISS Sorcar is free and open-source; all one needs is a model API key from a major LLM provider, such as Anthropic.  We implemented this framework in roughly 4 months, and the repository is available at \url{https://github.com/ksenxx/kiss_ai}. The name ``Sorcar'' pays homage to P.~C.~Sorcar, the Bengali magician.  The engineering principles described in Section~\ref{sec:system-prompt} are encoded in the agent's system prompt.
 
-KISS Sorcar has been built using itself.  The entire codebase---the KISS Agent framework, the Sorcar agent layers, the VS~Code extension, and the system prompt---was developed by KISS Sorcar operating on its own repository.  This self-hosting discipline provides a continuous-integration-style stress test: if the agent introduces a bug that impairs its ability to function, we ask the agent to fix it by analyzing the trajectory and code.  The simplicity of the layered architecture was both a prerequisite for and a consequence of this bootstrapping process. The simplicity of the framework reduced the number of bugs the agent introduced.  The five core agent classes are compact: the KISS Agent comprises 413~lines, the Relentless Agent 321~lines, the Sorcar Agent 322~lines, the Chat Sorcar Agent 125~lines, and the Worktree Sorcar Agent 704~lines---a total of roughly 1,885~lines of code (excluding empty lines and comments).
+KISS Sorcar has been built using itself.  The entire codebase---the KISS Agent framework, the Sorcar agent layers, the VS~Code extension, and the system prompt---was developed by KISS Sorcar operating on its own repository.  This self-hosting discipline provides a continuous-integration-style stress test: if the agent introduces a bug that impairs its ability to function, we ask the agent to fix it by analyzing the trajectory and code.  The simplicity of the layered architecture was both a prerequisite for and a consequence of this bootstrapping process. The simplicity of the framework reduced the number of bugs the agent introduced.  The five core agent classes are compact: the KISS Agent comprises 415~lines, the Relentless Agent 328~lines, the Sorcar Agent 322~lines, the Chat Sorcar Agent 125~lines, and the Worktree Sorcar Agent 702~lines---a total of roughly 1,892~lines of code (excluding empty lines and comments).
 
 In the project, we deliberately prioritize output quality over speed.  In our experience, using a weaker or cheaper model often forces the developer to discard the agent's work and retry, ultimately increasing the total cost of completing a task.  Conversely, giving a frontier model adequate time to validate its own output---running linters, type checkers, and tests before declaring success---reduces the ``slop'' (low-quality, subtly incorrect code) common in faster but less thorough agents.  We expect token costs and inference latencies to continue to fall~\citep {gao2025trae}, making this quality-first posture increasingly practical.  In the meantime, the code produced by our agent is well-organized, simple, and idiomatic.
 
@@ -180,7 +180,7 @@ The trajectory of the agent is stored in the file: {trajectory_file}
 - Read the trajectory file and analyze it.  The trajectory file
   could be large.
 - Return a precise chronologically-ordered list of things the
-  agent did, with the reason for doing that, along with relevant
+  agent did with the reason for doing that along with relevant
   code snippets
 \end{prompt}
 
@@ -315,8 +315,6 @@ The system prompt is a structured document that governs the agent's behavior acr
 
 \textbf{Identity-first ordering.}  We place the agent's identity and visibility constraints before any behavioral rules.  This follows the recommended prompt ordering for frontier models: the model should know \emph{what it is} before learning \emph{what to do}.
 
-\textbf{Calm, direct tone.}  An earlier version of this prompt used aggressive capitalized directives (e.g., ``BE RELENTLESS,'' ``NO AI SLOP'').  We found through extensive use that frontier models (Claude Opus~4.7, GPT~5.5, Gemini~3.1) respond more reliably to calm, direct language.  Anthropic's official prompting guide notes: ``Where you might have said `CRITICAL: You MUST use this tool when\ldots', you can use more normal prompting''~\citep{anthropic2025prompting}.  Aggressive emphasis causes overtriggering and unpredictable prioritization in newer models.  We replaced all such directives with positive, explanatory framing.
-
 We describe the key sections below.
 
 %......................................................................
@@ -330,7 +328,7 @@ The prompt opens with two XML-tagged sections that establish who the agent is an
 You are KISS Sorcar, an AI General Assistant and IDE
 developed by Koushik Sen (ksen@berkeley.edu).
 Repo: https://github.com/ksenxx/kiss_ai
-Version: 2026.5.8
+Version: 2026.5.23
 
 Your sole goal is completing the user's task accurately
 and thoroughly.  Be rigorous, check facts, and produce
@@ -386,9 +384,6 @@ Tool usage rules are explicit and mechanical:
 - If running out of context or steps, do not rush. Call
   finish(is_continue=True) to pause and resume the task
   in a new context.
-- At step 98 of 100: you must call
-  finish(is_continue=True) with a chronological summary
-  of work done, so the task can be resumed.
 </tool_rules>
 \end{prompt}
 
@@ -406,7 +401,7 @@ Each tool rule addresses a specific failure mode:
 
 \textbf{Parallel tool calls.}  The instruction to ``make them all in the same turn'' when tool calls are independent reduces latency by allowing the framework to execute multiple tool calls concurrently.  Without this instruction, the model tends to issue one tool call per turn even when the calls are independent, wasting round trips.
 
-\textbf{Context and continuation.}  When the context window is nearly full, LLMs exhibit a ``rush to finish'' behavior: they skip verification steps, make hasty edits, and call \texttt{finish} with an incomplete result.  The continuation instructions redirect that urgency into the continuation protocol (Section~\ref{sec:relentless-agent}), ensuring that a clean handoff to a new sub-session produces better results than a frantic attempt to squeeze everything into the remaining tokens.  The explicit ``step 98 of 100'' threshold provides a concrete trigger point that the model can check mechanically, rather than requiring it to estimate how much context remains.
+\textbf{Context and continuation.}  When the context window is nearly full, LLMs exhibit a ``rush to finish'' behavior: they skip verification steps, make hasty edits, and call \texttt{finish} with an incomplete result.  The continuation instructions redirect that urgency into the continuation protocol (Section~\ref{sec:relentless-agent}), ensuring that a clean handoff to a new sub-session produces better results than a frantic attempt to squeeze everything into the remaining tokens.
 
 %......................................................................
 \subsection{Pre-flight Checks}
@@ -671,15 +666,14 @@ information:
 This requirement applies to research and
 information-gathering tasks. For pure code edits, bug
 fixes, or file modifications where you already have
-sufficient context, proceed directly without web
-research.
+sufficient context, proceed directly.
 \end{prompt}
 
 \noindent The rationale is a two-phase separation between \emph{collection} and \emph{synthesis}.  LLMs tend to anchor on the first few results they encounter, which biases their solutions toward a narrow slice of the design space.  By forcing the agent to accumulate a broad set of information into a file \emph{before} reasoning about it, the protocol counteracts anchoring bias and encourages the model to consider diverse approaches.  The ``visit $\geq$30 websites'' threshold is deliberately aggressive: it ensures the agent does not shortcut the research phase after two or three hits, and the resulting information file serves as an auditable artifact of what the agent considered.  The structured procedure with a counter header (\texttt{\# Web Research --- Websites visited: 0/30}) and per-site entries (\texttt{\#\# [N/30] URL}) addresses an empirically observed failure mode in which the model claims to have ``visited many sites'' after only a handful of fetches; a concrete counter forces the model to verify the actual number visited before declaring the collection phase complete.  The instruction to try ``different queries, synonyms, official docs'' when results dry up prevents the agent from giving up prematurely on a narrow set of search terms.
 
 The login instruction addresses a practical obstacle in web research: many websites require authentication before revealing their content.  Rather than silently skipping gated pages or hallucinating their contents, we instruct the agent to ask the user for help with login.
 
-\textbf{Scoped applicability.}  The final paragraph---``This requirement applies to research and information-gathering tasks.  For pure code edits, bug fixes, or file modifications where you already have sufficient context, proceed directly without web research''---is an important addition.  Without this exemption, the agent would perform 30 website visits even for simple one-line code fixes where the necessary context is already in the file being edited, wasting tokens and tool-call budget.  The exemption allows the agent to skip research when the task is purely mechanical, while still enforcing thorough research for tasks that benefit from external information.
+\textbf{Scoped applicability.}  The final paragraph---``This requirement applies to research and information-gathering tasks.  For pure code edits, bug fixes, or file modifications where you already have sufficient context, proceed directly''---is an important addition.  Without this exemption, the agent would perform 30 website visits even for simple one-line code fixes where the necessary context is already in the file being edited, wasting tokens and tool-call budget.  The exemption allows the agent to skip research when the task is purely mechanical, while still enforcing thorough research for tasks that benefit from external information.
 
 %......................................................................
 \subsection{File Browsing Protocol}
@@ -711,7 +705,7 @@ The agent can interact with graphical desktop applications using screenshots, ke
 \begin{prompt}
 ## Desktop Apps
 
-Use screenshots, keyboard, and mouse. Don't launch VS Code or its extensions.
+Interact with desktop applications using screenshots, keyboard, and mouse. Do not launch VS Code or its extensions.
 \end{prompt}
 
 \noindent This instruction enables the agent to operate GUI applications (Preview, browsers, graphical diff tools) when command-line alternatives are insufficient.  The explicit prohibition on launching VS~Code prevents a recursive loop: since the agent runs \emph{inside} a VS~Code extension, launching another VS~Code instance or modifying extension state from within the agent could corrupt the host session or create deadlocks.  Note that modern LLMs support desktop control abilities, and we are merely exploiting them.
