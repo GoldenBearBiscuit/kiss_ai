@@ -353,7 +353,7 @@ was done.
 
 \textbf{Task focus.}  ``Your sole goal is completing the user's task accurately and thoroughly'' anchors the model on the task at hand and discourages meta-commentary, tangential exploration, and unsolicited clarification questions that consume tokens without making progress.  It also instructs the model to treat errors as obstacles to overcome rather than reasons to stop.
 
-\textbf{Visibility constraint as a separate section.}  The \texttt{<visibility\_constraint>} block is separated from tool rules because it governs a different concern: not \emph{how} to use tools, but \emph{what the user can see}.  Without this instruction, the model may ``tell'' the user something in an intermediate message and then assume the user has seen it, leading to confusion when the user asks for information the model believes it already provided.  The clause ``not a meta-description of what was done'' prevents the model from returning vague summaries like ``Fixed the bug in Y'' instead of showing the actual fix; it forces the model to include concrete details, results, and outputs in the summary.
+\textbf{Visibility constraint as a separate section.}  The \texttt{<visibility\_constraint>} block is separated from tool rules because it governs a different concern: not \emph{how} to use tools, but \emph{what the user can see}.  Without this instruction, the model may ``tell'' the user something in an intermediate message and then assume the user has seen it, leading to confusion when the user asks for information the model believes it already provided.  The clause ``not a meta-description of what was done'' prevents the model from returning vague summaries like ``Fixed the bug in Y'' instead of showing the actual fix; it forces the model to include concrete details, results, and outputs in the summary.  A second audit found that 3~out of 91~production tasks still produced meta-descriptions (e.g., ``Greeted the user and asked what they'd like to work on'' instead of the actual greeting).  The current version now includes explicit good/bad examples directly in the prompt to make the distinction concrete and unambiguous.
 
 %......................................................................
 \subsection{Tool Rules}
@@ -605,13 +605,18 @@ The testing section is perhaps the most opinionated:
 The agent maintains a preferences file that captures user invariants discovered during task execution:
 
 \begin{prompt}
-## Self-Improvement Loop
+## Self-Improvement Loop -- CRITICAL
 
-Update PWD/USER_PREFS.md with newly discovered user
-preferences and project invariants (no code snippets
-or symbol names; skip one-off task details). When
-adding new entries, remove any conflicting older
-entries.
+Before calling finish, check whether you learned
+anything new during this task -- a user preference,
+a project convention, a file location, an API
+pattern, a tool behavior, or any reusable fact. If
+you did, you MUST call Edit("PWD/USER_PREFS.md") to
+append the new entry before finishing.
+
+Rules: no code snippets or symbol names; skip
+one-off task details; remove conflicting older
+entries when adding new ones.
 \end{prompt}
 
 \noindent Each clause in this compact instruction serves the goal of cross-session learning:
@@ -623,6 +628,8 @@ entries.
 \textbf{``No code snippets/symbols; skip one-off tasks.''}  Code snippets in the preferences file are fragile: they become stale as the codebase evolves, and they consume tokens that would be better spent on natural-language descriptions of invariants.  The companion rule about one-off tasks prevents preference drift in the opposite direction: without it, the agent would record an entry every time it completed any task, gradually polluting the file with idiosyncratic details (a particular file path, a single throwaway experiment) that have no bearing on future work.  Together, the two clauses keep the file compact, robust to code changes, and focused on durable invariants.
 
 \textbf{``Remove conflicting old entries carefully and thoroughly.''}  Over time, preferences may become contradictory---for example, an early preference might say ``use camelCase for test methods'' while a later correction says ``use snake\_case.'' Without explicit conflict resolution, the file would accumulate contradictions, confusing the agent.  This instruction mandates that the agent actively resolve conflicts when updating the file to maintain internal consistency.  \emph{Note that we do not keep learnings in a database or in various folders because it makes the information stale when lots of code changes are happening.  It is impossible for an agent to eliminate stale information across databases and multiple folders.}
+
+\textbf{``Before calling finish'' and CRITICAL marker.}  A second audit of 91~production tasks revealed that the self-improvement loop had 0\%~compliance: not a single task proactively updated \texttt{USER\_PREFS.md}, even when the agent discovered reusable project facts (API endpoints, file locations, device names).  The original instruction (``Update \texttt{USER\_PREFS.md} with newly discovered preferences'') was too passive---the agent treated it as optional.  The current version makes the check mandatory by anchoring it to the finish call (``Before calling finish, check whether you learned anything new'') and provides concrete examples of what constitutes a learnable fact (``a file location, an API pattern, a tool behavior'').  After this change, integration tests confirm the agent now updates \texttt{USER\_PREFS.md} when it discovers new project conventions.
 
 %......................................................................
 \subsection{Pre-Finish Verification}
@@ -707,6 +714,8 @@ sufficient context, proceed directly.
 \noindent The rationale is a two-phase separation between \emph{collection} and \emph{synthesis}.  LLMs tend to anchor on the first few results they encounter, which biases their solutions toward a narrow slice of the design space.  By forcing the agent to accumulate a broad set of information into a file \emph{before} reasoning about it, the protocol counteracts anchoring bias and encourages the model to consider diverse approaches.  The ``visit $\geq$30 websites'' threshold is deliberately aggressive: it ensures the agent does not shortcut the research phase after two or three hits, and the resulting information file serves as an auditable artifact of what the agent considered.  The structured procedure with a counter header (\texttt{\# Web Research --- Websites visited: 0/30}) and per-site entries (\texttt{\#\# [N/30] URL}) addresses an empirically observed failure mode in which the model claims to have ``visited many sites'' after only a handful of fetches; a concrete counter forces the model to verify the actual number visited before declaring the collection phase complete.  The instruction to try ``different queries, synonyms, official docs'' when results dry up prevents the agent from giving up prematurely on a narrow set of search terms.
 
 An additional evasion pattern observed in production was the agent using \texttt{Bash("curl ...")} to fetch web pages instead of \texttt{go\_to\_url()}, thereby bypassing the browser-based visit counter while still gathering information.  Analysis of 91~real tasks found 4~research tasks that visited fewer than 30~sites (ranging from 1--5~URLs), with one task (1179) using \texttt{curl} to fetch content from 15+~sites without triggering \texttt{go\_to\_url}.  The explicit prohibition of \texttt{curl}/\texttt{wget} for research closes this loophole.
+
+A second audit uncovered two additional failure modes.  First, the mandatory information file (\texttt{tmp/information-\{id\}.md}) was created in 0~out of 4~research tasks---the agent skipped file creation entirely and answered from memory or from a handful of sites.  The current version adds explicit mandatory language: ``The file is your proof of work---if it doesn't exist when you call finish, you violated this rule.''  Second, one task claimed ``a synthesis of 30+~sources'' in its result summary while having visited only 4~URLs---a fabricated source count.  A new ``Real-Time Data'' section addresses both hallucination (answering current weather, news, or stock questions from stale training data---one task reported news from the wrong year) and source fabrication (``Do NOT fabricate or exaggerate source counts'').
 
 The login instruction addresses a practical obstacle in web research: many websites require authentication before revealing their content.  Rather than silently skipping gated pages or hallucinating their contents, we instruct the agent to ask the user for help with login.
 
