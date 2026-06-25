@@ -5364,11 +5364,14 @@ class RemoteAccessServer:
         it silently no-ops when not on the main thread or when the
         signal is unsupported on the current platform.
         """
-        for sig in (signal.SIGTERM, signal.SIGHUP):
+        for sig_name in ("SIGTERM", "SIGHUP"):
+            sig = getattr(signal, sig_name, None)
+            if sig is None:
+                continue  # unsupported on this platform (e.g. SIGHUP on Windows)
             try:
                 signal.signal(sig, self._handle_shutdown_signal)
             except (OSError, ValueError):
-                pass  # e.g. not main thread, or unsupported on this OS
+                pass  # e.g. not main thread
 
     def start(self) -> None:
         """Start the server (blocks until interrupted).
