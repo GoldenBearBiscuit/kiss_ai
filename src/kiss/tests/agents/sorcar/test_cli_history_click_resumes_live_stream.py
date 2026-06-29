@@ -58,6 +58,20 @@ from kiss.agents.sorcar.persistence import _add_task, _append_chat_event
 from kiss.agents.vscode.web_server import RemoteAccessServer
 
 
+def _reset_cli_daemon_writer() -> None:
+    """Drop the cached UDS writer between tests so a fresh daemon (on
+    a new temp socket path) is contacted instead of a stale connection
+    from a previous test."""
+    with cli_daemon_bridge._LOCK:
+        writer = cli_daemon_bridge._WRITER
+        if writer is not None:
+            try:
+                writer.close()
+            except OSError:
+                pass
+            cli_daemon_bridge._WRITER = None
+
+
 class TestCliHistoryClickResumesLiveStream(unittest.TestCase):
     """Click a running CLI task in history → live stream + green circle."""
 
@@ -96,7 +110,7 @@ class TestCliHistoryClickResumesLiveStream(unittest.TestCase):
 
         self._saved_env = os.environ.get("KISS_SORCAR_SOCK")
         os.environ["KISS_SORCAR_SOCK"] = self.sock_path
-        cli_daemon_bridge.reset_for_tests()
+        _reset_cli_daemon_writer()
 
         self._viewer_writer: asyncio.StreamWriter | None = None
 
@@ -105,7 +119,7 @@ class TestCliHistoryClickResumesLiveStream(unittest.TestCase):
             os.environ.pop("KISS_SORCAR_SOCK", None)
         else:
             os.environ["KISS_SORCAR_SOCK"] = self._saved_env
-        cli_daemon_bridge.reset_for_tests()
+        _reset_cli_daemon_writer()
 
         async def _shutdown() -> None:
             try:
@@ -172,7 +186,7 @@ class TestCliHistoryClickResumesLiveStream(unittest.TestCase):
             f"registered (expected {expected})"
         )
 
-    def _wait_for_cli_running(self, task_id: int,
+    def _wait_for_cli_running(self, task_id: str,
                               timeout: float = 2.0) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -184,7 +198,7 @@ class TestCliHistoryClickResumesLiveStream(unittest.TestCase):
             f"task_id={task_id} never registered in _cli_running_tasks"
         )
 
-    def _wait_for_cli_not_running(self, task_id: int,
+    def _wait_for_cli_not_running(self, task_id: str,
                                   timeout: float = 2.0) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -348,7 +362,7 @@ class TestCliHistoryClickResumesLiveStream(unittest.TestCase):
         row would mis-display the blinking green circle forever for
         a task that is no longer running anywhere.
         """
-        task_id = 9999
+        task_id = "9999cccccccccccccccccccccccccccc"
 
         # Open a dedicated UDS connection that we will close abruptly
         # below.  Using the bridge directly is what the CLI does, but

@@ -30,7 +30,11 @@ if TYPE_CHECKING:
     from kiss.agents.sorcar.running_agent_state import _RunningAgentState
     from kiss.agents.vscode.json_printer import JsonPrinter
 
-from kiss.agents.sorcar.git_worktree import GitWorktreeOps, repo_lock
+from kiss.agents.sorcar.git_worktree import (
+    GitWorktreeOps,
+    repo_lock,
+    strip_worktree_suffix,
+)
 from kiss.agents.sorcar.persistence import (
     _append_chat_event,
     _save_task_extra,
@@ -55,6 +59,59 @@ ctypes.pythonapi.PyThreadState_SetAsyncExc.argtypes = [
     ctypes.c_ulong,
     ctypes.py_object,
 ]
+
+
+def build_task_extra_payload(
+    *,
+    model: str,
+    work_dir: str,
+    version: str,
+    tokens: int,
+    cost: float,
+    steps: int,
+    is_parallel: bool,
+    is_worktree: bool,
+    auto_commit_mode: bool,
+    start_ms: int,
+    end_ms: int,
+) -> dict[str, object]:
+    """Build the persisted ``task_history.extra`` payload for a completed task.
+
+    Strips the ``.kiss-worktrees/kiss_wt-<slug>`` suffix from *work_dir*
+    so the persisted path is the user-visible workspace folder rather
+    than an ephemeral worktree directory that would vanish on merge or
+    discard.
+
+    Args:
+        model: Model name used for the task.
+        work_dir: Working directory the task ran from.  Worktree paths
+            are stripped to their parent repo.
+        version: KISS version string.
+        tokens: Total tokens consumed by the agent.
+        cost: Total budget consumed by the agent (USD).
+        steps: Total agent steps taken.
+        is_parallel: Whether parallel sub-agents were enabled.
+        is_worktree: Whether the task ran inside a worktree.
+        auto_commit_mode: Auto-commit toggle state at completion.
+        start_ms: Agent start timestamp in milliseconds since epoch.
+        end_ms: Agent end timestamp in milliseconds since epoch.
+
+    Returns:
+        Dict ready to pass to ``_save_task_extra``.
+    """
+    return {
+        "model": model,
+        "work_dir": strip_worktree_suffix(work_dir),
+        "version": version,
+        "tokens": tokens,
+        "cost": cost,
+        "steps": steps,
+        "is_parallel": is_parallel,
+        "is_worktree": is_worktree,
+        "auto_commit_mode": auto_commit_mode,
+        "startTs": start_ms,
+        "endTs": end_ms,
+    }
 
 
 def parse_task_tags(text: str) -> list[str]:
@@ -91,6 +148,7 @@ class _TaskRunnerMixin:
         work_dir: str
         _state_lock: threading.RLock
         _tab_chat_views: dict[str, str]
+        _pending_user_answer_tasks: dict[int, str]
 
         def _get_tab(self, tab_id: str) -> _RunningAgentState: ...
         def _any_non_wt_running(self) -> bool: ...
@@ -121,8 +179,9 @@ class _TaskRunnerMixin:
         def _get_worktree_changed_files(self, tab_id: str = "") -> list[str]: ...
         def _extract_result_summary(self) -> str: ...
         def _generate_followup_async(
-            self, task: str, result: str, task_id: int | None,
+            self, task: str, result: str, task_id: str | None,
         ) -> None: ...
+        def _refresh_files_after_task(self, work_dir: str = "") -> None: ...
 
     def _run_task(self, cmd: dict[str, Any]) -> None:
         """Run the agent with the given task.
@@ -150,7 +209,12 @@ class _TaskRunnerMixin:
         # (review #3 / #4 round 2 — A2 critical).  Echo the id verbatim
         # on every ``status`` broadcast for this run so the client's
         # ``current_task_id`` filter actually works in production.
-        client_task_id = cmd.get("taskId", "") or ""
+        # r3-vscode-H1: reject non-string ``taskId`` payloads (list,
+        # dict, bool, int) so they do not silently flow into the
+        # ``status`` envelope echo where they would later be compared
+        # by ``str ==`` against UUID strings on the client.
+        _raw_ctid = cmd.get("taskId", "")
+        client_task_id = _raw_ctid if isinstance(_raw_ctid, str) and _raw_ctid else ""
         try:
             status_start: dict[str, Any] = {
                 "type": "status",
@@ -252,7 +316,7 @@ class _TaskRunnerMixin:
             self._dispose_if_closed(tab_id)
 
     def _broadcast_status_end_to_viewers(
-        self, task_id: int | None, launcher_tab_id: str,
+        self, task_id: str | None, launcher_tab_id: str,
         *, client_task_id: str = "",
     ) -> None:
         """Broadcast ``status running=False`` to every viewer subscribed
@@ -573,7 +637,11 @@ class _TaskRunnerMixin:
                 self._subscribe_chat_viewers,
                 source_tab_id=tab_id,
                 start_ms=start_ms,
-                client_task_id=cmd.get("taskId", "") or "",
+                client_task_id=(
+                    cmd["taskId"]
+                    if isinstance(cmd.get("taskId"), str) and cmd["taskId"]
+                    else ""
+                ),
             )
 
             for task_prompt in subtasks:
@@ -856,19 +924,19 @@ class _TaskRunnerMixin:
                 # opened.
                 end_ms = int(time.time() * 1000)
                 _save_task_extra(
-                    {
-                        "model": model,
-                        "work_dir": work_dir,
-                        "version": __version__,
-                        "tokens": tab.agent.total_tokens_used,
-                        "cost": round(tab.agent.budget_used, 6),
-                        "steps": int(getattr(tab.agent, "total_steps", 0) or 0),
-                        "is_parallel": tab.use_parallel,
-                        "is_worktree": use_worktree,
-                        "auto_commit_mode": tab.auto_commit_mode,
-                        "startTs": start_ms,
-                        "endTs": end_ms,
-                    },
+                    build_task_extra_payload(
+                        model=model,
+                        work_dir=work_dir,
+                        version=__version__,
+                        tokens=tab.agent.total_tokens_used,
+                        cost=round(tab.agent.budget_used, 6),
+                        steps=int(getattr(tab.agent, "total_steps", 0) or 0),
+                        is_parallel=tab.use_parallel,
+                        is_worktree=use_worktree,
+                        auto_commit_mode=tab.auto_commit_mode,
+                        start_ms=start_ms,
+                        end_ms=end_ms,
+                    ),
                     task_id=tab.task_history_id,
                 )
                 self.printer.broadcast({"type": "tasks_updated"})
@@ -961,6 +1029,19 @@ class _TaskRunnerMixin:
                     "startTs": start_ms,
                     "endTs": end_ms,
                 })
+                # Refresh the ``@``-mention file cache for this
+                # work_dir: the agent may have created or deleted
+                # files during its turn, but the cache is only
+                # otherwise updated on cold start, daemon-wide
+                # ``setWorkDir``, or an explicit refresh.  Without
+                # this call the next ``@`` mention serves stale
+                # suggestions — new files invisible, deleted files
+                # still listed.  The hook is a background rescan
+                # that no-ops when the file set is unchanged (only
+                # modifications) and broadcasts an updated ``files``
+                # event when files were actually added or removed
+                # so any open picker UI refreshes immediately.
+                self._refresh_files_after_task(work_dir)
                 logger.info(
                     "Task lifecycle complete: tab_id=%s task_id=%s "
                     "elapsed_ms=%d event_type=%s",
@@ -1046,7 +1127,7 @@ class _TaskRunnerMixin:
 
     def _subscribe_chat_viewers(
         self,
-        task_id: int,
+        task_id: str,
         chat_id: str,
         *,
         source_tab_id: str,
@@ -1323,6 +1404,9 @@ class _TaskRunnerMixin:
         # THIS question instantly and the user would never see it.
         # Held under ``_state_lock`` so the drain cannot interleave
         # with ``_cmd_user_answer``'s drain-then-put sequence.
+        task_key = self.printer._coerce_task_id(
+            getattr(self.printer._thread_local, "task_id", None),
+        )
         q = self._resolve_task_answer_queue()
         if q is not None:
             with self._state_lock:
@@ -1331,8 +1415,15 @@ class _TaskRunnerMixin:
                         q.get_nowait()
                     except queue.Empty:  # pragma: no cover — race guard
                         break
-        self.printer.broadcast({
-            "type": "askUser",
-            "question": question,
-        })
-        return self._await_user_response()
+                if task_key:
+                    self._pending_user_answer_tasks[id(q)] = task_key
+        try:
+            self.printer.broadcast({
+                "type": "askUser",
+                "question": question,
+            })
+            return self._await_user_response()
+        finally:
+            if q is not None:
+                with self._state_lock:
+                    self._pending_user_answer_tasks.pop(id(q), None)

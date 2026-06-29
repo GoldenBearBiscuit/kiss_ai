@@ -110,7 +110,7 @@ class JsonPrinter(Printer):
     looked up from ``_subscribers[task_id]``.  A tab subscribes via
     :meth:`subscribe_tab` (e.g. when the user opens the task in a new
     browser tab) and unsubscribes via :meth:`cleanup_tab` (when the tab
-    closes) or :meth:`unsubscribe_tab`.
+    closes).
     """
 
     @property
@@ -204,25 +204,6 @@ class JsonPrinter(Printer):
                 viewers = set()
                 self._subscribers[key] = viewers
             viewers.add(tab_id)
-
-    def unsubscribe_tab(self, task_id: Any, tab_id: str) -> None:
-        """Remove *tab_id* from the subscriber set for *task_id*.
-
-        Args:
-            task_id: The task identifier (``task_history.id`` int or
-                its string form).
-            tab_id: The frontend tab id to unsubscribe.
-        """
-        key = self._coerce_task_id(task_id)
-        if not key or not tab_id:
-            return
-        with self._lock:
-            viewers = self._subscribers.get(key)
-            if viewers is None:
-                return
-            viewers.discard(tab_id)
-            if not viewers:
-                self._subscribers.pop(key, None)
 
     def _fanout_targets(self, task_id: Any) -> list[str]:
         """Return a snapshot of subscriber tab ids for *task_id*.
@@ -636,13 +617,29 @@ class JsonPrinter(Printer):
                 self._bash_state.streamed = False
             result_content = "" if streamed else truncate_result(str(content))
             if show_result:
-                self.broadcast(
-                    {
-                        "type": "tool_result",
-                        "content": result_content,
-                        "is_error": kwargs.get("is_error", False),
-                    }
-                )
+                # Carry ``tool_name`` and (for Read calls) the
+                # originating ``path`` / ``start_line`` over the wire
+                # so a daemon-attached sorcar CLI client can
+                # reconstruct the ``tool_input`` slice its local
+                # ``ConsolePrinter`` needs to syntax-highlight a Read
+                # result body.  Without this the daemon→CLI replay
+                # would always plain-write the file contents, even
+                # though the in-process CLI does highlight them.
+                event: dict[str, Any] = {
+                    "type": "tool_result",
+                    "content": result_content,
+                    "is_error": kwargs.get("is_error", False),
+                    "tool_name": tool_name,
+                }
+                tool_input = kwargs.get("tool_input") or {}
+                if isinstance(tool_input, dict):
+                    path = tool_input.get("file_path") or tool_input.get("path")
+                    if path:
+                        event["path"] = str(path)
+                    start_line = tool_input.get("start_line")
+                    if isinstance(start_line, int) and start_line >= 1:
+                        event["start_line"] = start_line
+                self.broadcast(event)
             return ""
         if type == "usage_info":
             raw_tokens = kwargs.get("total_tokens", 0)

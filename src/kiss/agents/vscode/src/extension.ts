@@ -15,6 +15,13 @@ import {getGitApi} from './gitApi';
 import {isReloadReady} from './reloadGuard';
 
 import {ensureDependencies, ensureLocalBinInPath} from './DependencyInstaller';
+import {findKissProject} from './kissPaths';
+import {checkForExtensionUpdate} from './UpdateChecker';
+import {
+  showErrorNotification,
+  showInformationNotification,
+  showWarningNotification,
+} from './WebviewNotifications';
 
 let sidebarView: SorcarSidebarView | undefined;
 
@@ -70,7 +77,7 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!editor) return;
       const sel = editor.document.getText(editor.selection);
       if (!sel || !sel.trim()) {
-        vscode.window.showInformationMessage('No text selected');
+        showInformationNotification('No text selected');
         return;
       }
       sidebarView!.submitTask(sel.trim());
@@ -84,7 +91,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const sel = editor.selection;
       const text = editor.document.getText(sel);
       if (!text || !text.trim()) {
-        vscode.window.showInformationMessage('No text selected');
+        showInformationNotification('No text selected');
         return;
       }
       const filePath = vscode.workspace.asRelativePath(editor.document.uri);
@@ -92,7 +99,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const startCol = sel.start.character + 1;
       const endLine = sel.end.line + 1;
       const endCol = sel.end.character + 1;
-      const hunkRef = `text from (line, col)=(${startLine},${startCol}) to (line, col)=(${endLine},${endCol}) in PWD/${filePath}`;
+      const hunkRef = `text from (line, col)=(${startLine},${startCol}) to (line, col)=(${endLine},${endCol}) in ./${filePath}`;
       void sidebarView!.appendToInput(hunkRef);
     }),
   );
@@ -162,7 +169,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const countdownWasRunning = stopCommitCountdown !== undefined;
       stopCommitCountdown?.();
       if (ev.error) {
-        vscode.window.showWarningMessage(`Commit message: ${ev.error}`);
+        showWarningNotification(`Commit message: ${ev.error}`);
         if (countdownWasRunning) void setScmMessage('');
       } else if (ev.message) {
         void setScmMessage(ev.message);
@@ -422,9 +429,39 @@ export function activate(context: vscode.ExtensionContext): void {
   ensureDependencies().catch(err => {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[KISS Sorcar] Dependency setup error:', err);
-    vscode.window.showErrorMessage(
+    showErrorNotification(
       `KISS Sorcar: Setup failed — ${msg}. Check ~/.kiss/install.log for details.`,
     );
+  });
+
+  // Active upstream update check.
+  //
+  // ``ensureDependencies()`` only restarts the kiss-web daemon on the
+  // slow (install) path; on the fast "all deps present" path the
+  // already-running daemon's PyPI poll is the only thing watching
+  // PyPI — and that poll's cached answer can be up to an hour stale.
+  // We additionally probe PyPI directly here so a fresh VS Code launch
+  // always sees the most recent release without waiting for the next
+  // daemon poll cycle.  All side effects are guarded:
+  //   * the helper rate-limits itself via ~/.kiss/.update-check.json
+  //     so we hit PyPI at most a few times per day;
+  //   * any error (network, malformed payload) is swallowed so update
+  //     checking can never break extension activation.
+  void checkForExtensionUpdate({
+    kissProjectPath: findKissProject() || undefined,
+    notify: ({latest, current}: {latest: string; current: string}) => {
+      void showInformationNotification(
+        `KISS Sorcar: a new release (${latest}) is available. ` +
+          `You are on ${current}.`,
+        'Update now',
+      ).then(action => {
+        if (action === 'Update now') {
+          sidebarView?.runUpdate();
+        }
+      });
+    },
+  }).catch(err => {
+    console.error('[KISS Sorcar] Update check failed:', err);
   });
 
   console.log('KISS Sorcar extension activated');

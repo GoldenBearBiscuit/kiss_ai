@@ -4,24 +4,14 @@
 # add your name here
 """Resolve and lazily seed ``~/.kiss/<asset>`` markdown assets.
 
-At runtime ``~/.kiss/<asset>`` is the source of truth for
-``INJECTIONS.md`` and ``SAMPLE_TASKS.md``; the package copy bundled
-alongside the source tree is the seed / fallback.
-
-**Install-time behaviour** (``install.sh`` and
-``DependencyInstaller.ts``): on every install or version upgrade both
-files are *always* copied from the package into ``~/.kiss/``,
-overwriting any prior copy.  This ensures the latest bundled Markdown
-is served immediately after an update — matching the ``MODEL_INFO.json``
-pattern.
-
-**Runtime behaviour** (this module): if ``~/.kiss/<asset>`` exists
-return it as-is; user edits made *between* installs survive every
-daemon restart and ``uv run`` invocation.  If the user copy is missing
-(e.g. first run in a sandboxed test environment that skipped the
-installer), seed it from the package copy and return the new path.
-When ``~/.kiss/`` is not writable (read-only FS, missing ``HOME``)
-return the package copy directly so the caller still sees a valid file.
+:func:`ensure_user_asset_from_default` seeds a user copy from an
+**inline string default**, with no package file involved.  Used for
+``MY_TASK_TEMPLATES.md`` (welcome-screen chips) and
+``MY_INJECTION.md`` (Inject instruction panel), both purely
+user-curated files whose only "bundled" content is a tiny inline
+starter (``## Task\\n\\nHi!\\n`` and a ``## Trick`` test-first
+starter, respectively).  Returns ``None`` when ``~/.kiss/`` is not
+writable so the caller can skip silently.
 
 ``KISS_HOME`` overrides the default ``~/.kiss`` location, matching the
 rest of the kiss codebase (``persistence.py``, ``web_server.py``,
@@ -31,7 +21,6 @@ rest of the kiss codebase (``persistence.py``, ``web_server.py``,
 from __future__ import annotations
 
 import os
-import shutil
 from pathlib import Path
 
 
@@ -40,33 +29,31 @@ def kiss_home_dir() -> Path:
     return Path(os.environ.get("KISS_HOME") or (Path.home() / ".kiss"))
 
 
-def ensure_user_asset(name: str, package_path: Path) -> Path:
-    """Return the path the runtime should read ``name`` from.
+def ensure_user_asset_from_default(
+    name: str, default_content: str,
+) -> Path | None:
+    """Return ``~/.kiss/<name>``, seeding it with ``default_content`` if absent.
+
+    Used for assets like ``MY_TASK_TEMPLATES.md`` whose source of
+    truth is the user's local copy — there is no bundled package
+    file, only a tiny inline default written on first read.
 
     Args:
-        name: Asset file name (e.g. ``"INJECTIONS.md"``).  The user
-            copy lives at ``~/.kiss/<name>``.
-        package_path: Path to the package copy bundled in the source
-            tree, used as the seed for the user copy and as the
-            fallback when ``~/.kiss/`` is not writable.
+        name: Asset file name (e.g. ``"MY_TASK_TEMPLATES.md"``).
+        default_content: UTF-8 string written to ``~/.kiss/<name>``
+            on first read.  Never overwrites an existing file.
 
     Returns:
-        Path to the file the caller should read.  Prefers the user
-        copy at ``~/.kiss/<name>``; falls back to ``package_path``
-        when the user copy cannot be created (read-only ``HOME``,
-        missing parent, etc.) or when neither file exists.
+        Path to ``~/.kiss/<name>`` when the file exists or was just
+        created.  ``None`` when ``~/.kiss/`` is not writable (read-only
+        FS, missing ``HOME``) so callers can skip silently.
     """
     user_path = kiss_home_dir() / name
     try:
         if user_path.exists():
-            # User copy wins unconditionally; user edits are never
-            # silently clobbered by a newer package copy.  To pull in a
-            # fresh bundled copy the user removes ``~/.kiss/<name>``.
             return user_path
-        if package_path.exists():
-            user_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(package_path, user_path)
-            return user_path
+        user_path.parent.mkdir(parents=True, exist_ok=True)
+        user_path.write_text(default_content)
+        return user_path
     except OSError:
-        pass
-    return package_path
+        return None

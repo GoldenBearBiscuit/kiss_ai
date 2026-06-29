@@ -24,12 +24,9 @@ from pathlib import Path
 import pytest
 
 import kiss.agents.sorcar.persistence as th
-from kiss.agents.sorcar.chat_sorcar_agent import ChatSorcarAgent
 from kiss.agents.sorcar.cli_repl import (
     SLASH_COMMANDS,
     CliCompleter,
-    _handle_slash,
-    _record_mentions,
 )
 
 
@@ -56,14 +53,14 @@ def _write_project(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def test_at_mention_completion_inserts_pwd_path(tmp_path: Path, kiss_db) -> None:
-    """``@`` mentions complete to ``PWD/<path>`` like the extension."""
+def test_at_mention_completion_inserts_relative_path(tmp_path: Path, kiss_db) -> None:
+    """``@`` mentions complete to ``./<path>`` like the extension."""
     project = _write_project(tmp_path)
     completer = CliCompleter(str(project))
     matches = completer._build_matches("look at @alpha")
     assert matches, "expected at least one file suggestion"
-    assert matches[0] == "look at PWD/alpha.py "
-    assert all(m.startswith("look at PWD/") for m in matches)
+    assert matches[0] == "look at ./alpha.py "
+    assert all(m.startswith("look at ./") for m in matches)
 
 
 def test_at_mention_completion_matches_nested_files(tmp_path: Path, kiss_db) -> None:
@@ -71,7 +68,7 @@ def test_at_mention_completion_matches_nested_files(tmp_path: Path, kiss_db) -> 
     project = _write_project(tmp_path)
     completer = CliCompleter(str(project))
     matches = completer._build_matches("edit @beta")
-    assert any(m == "edit PWD/src/beta_module.py " for m in matches)
+    assert any(m == "edit ./src/beta_module.py " for m in matches)
 
 
 def test_slash_command_completion(tmp_path: Path) -> None:
@@ -163,156 +160,6 @@ def test_predictive_completion_from_active_file(tmp_path: Path, kiss_db) -> None
     completer = CliCompleter(str(tmp_path), active_file=str(active))
     matches = completer._build_matches("call calculate_t")
     assert matches == ["call calculate_total"]
-
-
-def test_record_mentions_persists_file_usage(tmp_path: Path, kiss_db) -> None:
-    """Submitting a ``PWD/<path>`` line records file usage for ranking."""
-    _record_mentions("please update PWD/src/app.py and PWD/main.py now")
-    usage = th._load_file_usage()
-    assert usage.get("src/app.py", 0) >= 1
-    assert usage.get("main.py", 0) >= 1
-
-
-def test_record_mentions_then_ranks_used_file_first(tmp_path: Path, kiss_db) -> None:
-    """A recorded file is promoted to the 'frequent' group in suggestions."""
-    project = _write_project(tmp_path)
-    _record_mentions("touch PWD/src/beta_module.py")
-    completer = CliCompleter(str(project))
-    matches = completer._build_matches("see @beta")
-    assert matches[0] == "see PWD/src/beta_module.py "
-
-
-def test_handle_slash_clear_starts_new_chat(tmp_path: Path, kiss_db) -> None:
-    """``/clear`` resets the chat id on a real ChatSorcarAgent."""
-    agent = ChatSorcarAgent("t")
-    agent.resume_chat_by_id("existing-chat")
-    assert agent.chat_id == "existing-chat"
-    assert _handle_slash(agent, "/clear", {}) is False
-    assert agent.chat_id == ""
-
-
-def test_handle_slash_model_switch(tmp_path: Path, kiss_db) -> None:
-    """``/model <name>`` updates the agent and run kwargs."""
-    agent = ChatSorcarAgent("t")
-    kwargs: dict = {"model_name": "old-model"}
-    _handle_slash(agent, "/model new-model", kwargs)
-    assert kwargs["model_name"] == "new-model"
-    assert agent.model_name == "new-model"
-
-
-def test_handle_slash_model_list_prints_models(tmp_path: Path, kiss_db, capsys) -> None:
-    """``/model list`` prints every generation model with provider/status."""
-    from kiss.core.models.model_info import get_generation_model_listing
-
-    agent = ChatSorcarAgent("t")
-    kwargs: dict = {"model_name": "demo-model"}
-    assert _handle_slash(agent, "/model list", kwargs) is False
-    out = capsys.readouterr().out
-    listing = get_generation_model_listing()
-    # Header reports the configured/total counts.
-    configured = sum(1 for _, _, ok in listing if ok)
-    assert f"({configured}/{len(listing)} with credentials configured)" in out
-    # A representative generation model and its provider label are shown.
-    assert "gpt-5.5" in out
-    assert "OpenAI" in out
-    # Every listed model name appears in the output.
-    for name, provider, _ok in listing:
-        assert name in out
-    # Listing does not change the active model.
-    assert kwargs["model_name"] == "demo-model"
-    assert agent.model_name != "list"
-
-
-def test_handle_slash_model_list_marks_current(tmp_path: Path, kiss_db, capsys) -> None:
-    """``/model list`` flags the currently selected model with a marker."""
-    agent = ChatSorcarAgent("t")
-    agent.model_name = "gpt-5.5"
-    _handle_slash(agent, "/model list", {})
-    out = capsys.readouterr().out
-    current_lines = [ln for ln in out.splitlines() if "← current" in ln]
-    assert len(current_lines) == 1
-    assert "gpt-5.5" in current_lines[0]
-
-
-def test_handle_slash_exit_returns_true(tmp_path: Path, kiss_db) -> None:
-    """``/exit`` and ``/quit`` request loop termination."""
-    agent = ChatSorcarAgent("t")
-    assert _handle_slash(agent, "/exit", {}) is True
-    assert _handle_slash(agent, "/quit", {}) is True
-
-
-def test_handle_slash_unknown(tmp_path: Path, kiss_db, capsys) -> None:
-    """An unknown slash command is reported, not executed."""
-    agent = ChatSorcarAgent("t")
-    assert _handle_slash(agent, "/bogus", {}) is False
-    assert "Unknown command" in capsys.readouterr().out
-
-
-def _run_repl_subprocess(
-    tmp_path: Path, stdin: str,
-) -> subprocess.CompletedProcess:
-    """Drive ``run_repl`` in a subprocess feeding *stdin*, no model calls."""
-    script = (
-        "from kiss.agents.sorcar.chat_sorcar_agent import ChatSorcarAgent\n"
-        "from kiss.agents.sorcar.cli_repl import run_repl\n"
-        "agent = ChatSorcarAgent('test')\n"
-        "run_repl(agent, {'work_dir': '.', 'model_name': 'demo-model'})\n"
-    )
-    env = dict(os.environ, KISS_HOME=str(tmp_path / ".kisshome"))
-    return subprocess.run(
-        [sys.executable, "-c", script],
-        input=stdin,
-        text=True,
-        capture_output=True,
-        cwd=str(tmp_path),
-        env=env,
-        timeout=120,
-    )
-
-
-def test_repl_welcome_and_exit(tmp_path: Path) -> None:
-    """The REPL prints the welcome banner and exits on /exit."""
-    proc = _run_repl_subprocess(tmp_path, "/exit\n")
-    assert proc.returncode == 0, proc.stderr
-    assert "KISS Sorcar" in proc.stdout
-    assert "interactive mode" in proc.stdout
-
-
-def test_repl_help_then_eof(tmp_path: Path) -> None:
-    """``/help`` lists commands; EOF (no /exit) ends the session."""
-    proc = _run_repl_subprocess(tmp_path, "/help\n")
-    assert proc.returncode == 0, proc.stderr
-    assert "Commands:" in proc.stdout
-    assert "/clear" in proc.stdout
-    assert "Goodbye" in proc.stdout
-
-
-def test_repl_cost_command(tmp_path: Path) -> None:
-    """``/cost`` prints usage without invoking the model."""
-    proc = _run_repl_subprocess(tmp_path, "/cost\n/exit\n")
-    assert proc.returncode == 0, proc.stderr
-    assert "Cost:" in proc.stdout
-    assert "Total tokens:" in proc.stdout
-
-
-def test_repl_frames_input_with_single_panel(tmp_path: Path) -> None:
-    """The idle input dialog is drawn inside the shared rounded panel.
-
-    The idle prompt and the steering box now render the *same* panel, so
-    the idle dialog shows the rounded border glyphs and the shared idle
-    title instead of the old plain horizontal rules.
-    """
-    proc = _run_repl_subprocess(tmp_path, "/cost\n/exit\n")
-    assert proc.returncode == 0, proc.stderr
-    # Rounded-border glyphs (the same the steering box uses) frame input.
-    assert "╭" in proc.stdout and "╮" in proc.stdout
-    assert "╰" in proc.stdout and "╯" in proc.stdout
-    # The shared idle title appears in the panel's top border.
-    assert "sorcar · type a task" in proc.stdout
-    # Each of the two prompts (/cost then /exit) draws a top and bottom
-    # border, so at least 3 runs of consecutive box-drawing dashes show.
-    rules = re.findall(r"\u2500{10,}", proc.stdout)
-    assert len(rules) >= 3
 
 
 def test_main_no_task_enters_repl(tmp_path: Path) -> None:

@@ -160,6 +160,60 @@ class MergeResult(enum.Enum):
     STASH_FAILED = "stash_failed"
 
 
+# Sentinel directory under which the framework creates per-task worktrees.
+# Layout: ``<repo>/.kiss-worktrees/kiss_wt-<slug>/...``.
+_WORKTREE_SUBDIR = ".kiss-worktrees"
+_WORKTREE_SLUG_PREFIX = "kiss_wt-"
+
+
+def strip_worktree_suffix(path: str) -> str:
+    """Return *path* with the ``.kiss-worktrees/kiss_wt-<slug>[/...]``
+    suffix removed, leaving the parent repository path.
+
+    Worktree directories are ephemeral — they are deleted when the
+    worktree is merged or discarded.  Persisting a worktree path in
+    long-lived storage (e.g. ``task_history.extra.work_dir``) would
+    leave dangling references the user-visible UI cannot resolve.  Use
+    this helper at every persistence boundary that records a
+    ``work_dir`` for later display or filtering.
+
+    Paths that do not contain a ``<repo>/.kiss-worktrees/kiss_wt-*``
+    segment are returned unchanged, including the empty string.
+
+    Args:
+        path: An absolute or relative filesystem path string.
+
+    Returns:
+        The parent-repo path string, or the unchanged input when the
+        path is not inside a KISS worktree.
+    """
+    if not path:
+        return path
+    # Split on os-agnostic separators so the helper works on POSIX paths
+    # carried across platforms (tests, payloads from remote daemons).
+    # ``str.replace`` first folds Windows separators to ``/`` so the
+    # logic is uniform.
+    norm = path.replace("\\", "/")
+    parts = norm.split("/")
+    for i, segment in enumerate(parts):
+        if (
+            segment == _WORKTREE_SUBDIR
+            and i + 1 < len(parts)
+            and parts[i + 1].startswith(_WORKTREE_SLUG_PREFIX)
+        ):
+            parent = "/".join(parts[:i])
+            if parent:
+                # Normal case: ``/Users/x/proj/.kiss-worktrees/kiss_wt-…``
+                # → ``/Users/x/proj``.
+                return parent
+            # No parent segments before ``.kiss-worktrees``.  For an
+            # absolute path (``/.kiss-worktrees/kiss_wt-…``) the parent
+            # is the filesystem root; for a relative path
+            # (``.kiss-worktrees/kiss_wt-…``) it is the current dir.
+            return "/" if norm.startswith("/") else "."
+    return path
+
+
 def _unquote_git_path(path: str) -> str:
     """Unquote a C-style quoted filename from ``git status --porcelain``.
 
@@ -426,6 +480,25 @@ class GitWorktreeOps:
         """
         status = _git("status", "--porcelain", cwd=wt_dir)
         return bool(status.stdout.strip())
+
+    @staticmethod
+    def status_porcelain(wt_dir: Path) -> str:
+        """Return the raw ``git status --porcelain`` output.
+
+        Used by failure-path warnings (e.g.
+        :meth:`~kiss.agents.sorcar.worktree_sorcar_agent.WorktreeSorcarAgent._finalize_worktree`)
+        to embed the exact leftover files in the log so an operator
+        can tell a real pre-commit-hook rejection apart from a race
+        leftover or a corrupt index without having to ssh in and
+        run git themselves.
+
+        Args:
+            wt_dir: Git working directory to inspect.
+
+        Returns:
+            The stripped porcelain output (possibly empty).
+        """
+        return _git("status", "--porcelain", cwd=wt_dir).stdout.strip()
 
     @staticmethod
     def staged_diff(wt_dir: Path) -> str:
@@ -738,16 +811,19 @@ class GitWorktreeOps:
         """Install a merge driver that auto-resolves agent scratch files.
 
         ``PROGRESS.md`` is a tracked per-task agent log that every task
-        wholesale rewrites ("clear PROGRESS.md when a new task begins").
-        Whenever main's copy diverged from the worktree's fork point,
-        the whole-file rewrite on both sides made every three-way merge
-        (``git merge --squash`` and ``git cherry-pick`` alike) conflict
-        — blocking the entire worktree merge over a scratch file.
+        wholesale rewrites ("clear PROGRESS.md when a new task begins"),
+        and ``src/kiss/INJECTIONS.md`` is an agent-maintained scratch
+        prompt file that can drift between task baselines.  Whenever
+        main's copy diverged from the worktree's fork point, these
+        scratch-file rewrites made three-way merges (``git merge
+        --squash`` and ``git cherry-pick`` alike) conflict — blocking
+        the entire worktree merge over non-user source state.
 
         This registers a repo-local ``kiss-scratch`` merge driver that
         resolves content conflicts in such files by keeping the
-        incoming branch's version (``%B``): the newest task's log wins,
-        matching the clear-on-new-task convention.  Installation uses
+        incoming branch's version (``%B``): the newest task's scratch
+        state wins, matching the clear-on-new-task convention.
+        Installation uses
         only untracked plumbing — ``<git_common_dir>/info/attributes``
         plus repo-local config — so no tracked file is ever modified,
         and the driver equally fixes the *manual* merge/cherry-pick
@@ -756,9 +832,10 @@ class GitWorktreeOps:
         Args:
             repo: Git repo root path.
         """
-        GitWorktreeOps._append_info_line(
-            repo, "attributes", "PROGRESS.md merge=kiss-scratch"
-        )
+        for scratch_path in ("PROGRESS.md", "src/kiss/INJECTIONS.md"):
+            GitWorktreeOps._append_info_line(
+                repo, "attributes", f"{scratch_path} merge=kiss-scratch"
+            )
         _git(
             "config",
             "merge.kiss-scratch.name",
@@ -853,20 +930,6 @@ class GitWorktreeOps:
         return GitWorktreeOps._save_branch_config(
             repo, branch, "kiss-baseline", sha, "baseline commit"
         )
-
-    @staticmethod
-    def load_baseline_commit(repo: Path, branch: str) -> str | None:
-        """Load the baseline commit SHA from git config.
-
-        Args:
-            repo: Git repo root path.
-            branch: The worktree branch name.
-
-        Returns:
-            The baseline commit SHA, or ``None`` if not stored (clean
-            worktree or legacy worktree without baseline support).
-        """
-        return GitWorktreeOps._load_branch_config(repo, branch, "kiss-baseline")
 
     @staticmethod
     def _remove_path(path: Path) -> None:
@@ -1070,111 +1133,3 @@ class GitWorktreeOps:
         GitWorktreeOps.remove(repo, wt_dir)
         GitWorktreeOps.prune(repo)
         GitWorktreeOps.delete_branch(repo, branch)
-
-    @staticmethod
-    def cleanup_orphans(repo: Path) -> str:
-        """Scan for orphaned ``kiss/wt-*`` branches and worktrees.
-
-        Serialized under :func:`repo_lock`: the scan snapshots
-        ``git worktree list`` and later deletes branches and rmtree's
-        unregistered directories under ``.kiss-worktrees/``.  Without
-        the lock, a worktree registered by a concurrent task start
-        (``_try_setup_worktree``) after the snapshot would look like
-        an orphan directory and be deleted out from under the active
-        task.
-
-        Args:
-            repo: Root of the git repository to scan.
-
-        Returns:
-            Summary of findings and any cleanup actions taken.
-        """
-        with repo_lock(repo):
-            return GitWorktreeOps._cleanup_orphans_locked(repo)
-
-    @staticmethod
-    def _cleanup_orphans_locked(repo: Path) -> str:
-        """Do the orphan scan/cleanup; caller must hold :func:`repo_lock`.
-
-        Cleans up three distinct forms of stale state:
-
-        1.  ``kiss/wt-*`` branches with no active git worktree and no
-            ``kiss-original`` config (true orphan branches).
-        2.  Registered worktree bookkeeping entries whose directory
-            is gone (``git worktree prune``).
-        3.  Directories under ``.kiss-worktrees/`` that are not
-            registered as git worktrees (orphan directories — e.g.
-            leftover files from a crashed agent session or a manually
-            unlinked worktree).  Pending-merge branches (those with
-            ``kiss-original`` set) are never removed — BUG-58.
-
-        Args:
-            repo: Root of the git repository to scan.
-
-        Returns:
-            Summary of findings and any cleanup actions taken.
-        """
-        result = _git(
-            "for-each-ref",
-            "--format=%(refname:short)",
-            "refs/heads/kiss/wt-*",
-            cwd=repo,
-        )
-        branches = result.stdout.strip().splitlines() if result.stdout.strip() else []
-
-        wt_result = _git("worktree", "list", "--porcelain", cwd=repo)
-        worktree_branches: set[str] = set()
-        registered_dirs: set[Path] = set()
-        for line in wt_result.stdout.splitlines():
-            if line.startswith("branch refs/heads/kiss/wt-"):
-                worktree_branches.add(line.split("refs/heads/")[1])
-            elif line.startswith("worktree "):
-                registered_dirs.add(Path(line.split(" ", 1)[1]).resolve())
-
-        orphan_branches: list[str] = []
-        pending_branches: list[str] = []
-        for b in branches:
-            if b in worktree_branches:
-                continue
-            original = GitWorktreeOps.load_original_branch(repo, b)
-            if original is not None:
-                pending_branches.append(b)
-            else:
-                orphan_branches.append(b)
-
-        lines = [
-            f"Found {len(branches)} kiss/wt-* branch(es), "
-            f"{len(worktree_branches)} active worktree(s)."
-        ]
-
-        if pending_branches:
-            lines.append(f"Pending-merge branches (kept): {pending_branches}")
-
-        if orphan_branches:
-            lines.append(f"Orphaned branches (no worktree): {orphan_branches}")
-            for b in orphan_branches:
-                _git("branch", "-D", b, cwd=repo)
-                GitWorktreeOps._remove_branch_config_section(repo, b)
-                lines.append(f"  Deleted: {b}")
-
-        _git("worktree", "prune", cwd=repo)
-        lines.append("Ran git worktree prune.")
-
-        wt_root = repo / ".kiss-worktrees"
-        orphan_dirs: list[str] = []
-        if wt_root.is_dir():
-            for child in sorted(wt_root.iterdir()):
-                if not child.is_dir():
-                    continue
-                if child.resolve() in registered_dirs:
-                    continue
-                shutil.rmtree(child, ignore_errors=True)
-                orphan_dirs.append(child.name)
-
-        if orphan_dirs:
-            lines.append(f"Orphan directories removed: {orphan_dirs}")
-
-        if not orphan_branches and not orphan_dirs:
-            lines.append("No orphans found.")
-
-        return "\n".join(lines)

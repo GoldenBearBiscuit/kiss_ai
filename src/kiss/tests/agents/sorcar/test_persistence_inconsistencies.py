@@ -16,7 +16,7 @@ Each test class targets one confirmed bug (see ``tmp/findings-1.md``):
 * **A3** — ``_save_task_extra`` blind-overwrote the ``extra`` JSON
   column, destroying the ``is_favorite`` flag that
   ``_set_task_favorite`` merge-updates.
-* **A4** — ``_get_history_entry`` and ``_prefix_match_task`` lacked the
+* **A4** — ``_prefix_match_task`` lacked the
   sub-agent exclusion filter used by ``_load_history`` /
   ``_search_history``, so their row indexing disagreed with the UI list
   and sub-agent internal task text leaked into autocomplete.
@@ -39,7 +39,6 @@ from kiss.agents.sorcar.persistence import (
     _add_task,
     _delete_task,
     _flush_chat_events,
-    _get_history_entry,
     _load_chat_context_text,
     _load_chat_events_by_task_id,
     _load_history,
@@ -80,7 +79,7 @@ class _TempDbTestBase:
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
 
-def _read_extra(task_id: int) -> dict[str, object]:
+def _read_extra(task_id: str) -> dict[str, object]:
     """Load the parsed ``extra`` JSON of a history row via the public reader."""
     for entry in _load_history():
         if entry["id"] == task_id:
@@ -173,45 +172,45 @@ class TestA3SaveTaskExtraPreservesFavorite(_TempDbTestBase):
         tid, _ = _add_task("unfav task")
         assert _set_task_favorite(tid, True) is True
 
-        # A payload explicitly carrying is_favorite must be honored as-is.
-        _save_task_extra({"tokens": 1, "is_favorite": False}, task_id=tid)
+        # r3-H1 + r5-persistence-C2: ``_save_task_extra`` no longer
+        # honours ``is_favorite`` in the payload — it raises
+        # ``ValueError`` instead of silently dropping.
+        # ``_set_task_favorite`` is the only sanctioned writer.
+        import pytest as _pytest
+        with _pytest.raises(ValueError, match="_set_task_favorite"):
+            _save_task_extra(
+                {"tokens": 1, "is_favorite": False}, task_id=tid,
+            )
 
         extra = _read_extra(tid)
-        assert extra.get("is_favorite") is False
-        assert extra.get("tokens") == 1
+        assert extra.get("is_favorite") is True
 
     def test_extra_without_prior_favorite_written_verbatim(self) -> None:
         tid, _ = _add_task("plain task")
         _save_task_extra({"tokens": 7}, task_id=tid)
 
         extra = _read_extra(tid)
+        # r3-H3: ``_row_to_extra_json`` always emits every typed
+        # column.  Pop the defaulted ones so the test asserts ONLY
+        # the explicitly-written ``tokens`` value.
+        for k in (
+            "auto_commit_mode", "is_parallel", "is_worktree",
+            "is_favorite", "model", "work_dir", "version",
+            "cost", "steps", "startTs", "endTs",
+        ):
+            extra.pop(k, None)
         assert extra == {"tokens": 7}
 
 
 class TestA4SubagentFilterConsistency(_TempDbTestBase):
     """[A4] history-entry indexing and prefix matching must skip sub-agents."""
 
-    def test_get_history_entry_index_matches_load_history(self) -> None:
-        _add_task("parent task")
-        time.sleep(0.01)
-        _add_task(
-            "subagent internal task",
-            extra={"subagent": {"parent_task_id": 1}},
-        )
-
-        entry = _get_history_entry(0)
-        assert entry is not None
-        assert entry["task"] == "parent task"
-        # Index space must agree with the filtered UI list.
-        assert entry["task"] == _load_history()[0]["task"]
-        assert _get_history_entry(1) is None
-
     def test_prefix_match_skips_subagent_rows(self) -> None:
-        _add_task("visible parent task")
+        parent_id, _ = _add_task("visible parent task")
         time.sleep(0.01)
         _add_task(
             "subagent internal task",
-            extra={"subagent": {"parent_task_id": 1}},
+            extra={"subagent": {"parent_task_id": parent_id}},
         )
 
         assert _prefix_match_task("subagent") == ""

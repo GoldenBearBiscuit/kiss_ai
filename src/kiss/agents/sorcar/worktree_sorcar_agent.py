@@ -133,6 +133,13 @@ class WorktreeSorcarAgent(ChatSorcarAgent):
         # the owning :class:`_RunningAgentState` and pull queued
         # follow-up prompts before each model call.
         self._tab_id: str = ""
+        # Notification id for the in-flight auto-commit toast.
+        # Set at the start of every ``_auto_commit_worktree`` call so
+        # the "generating" and "committed" stages share a single id —
+        # ``media/main.js`` ``showNotification`` then updates the
+        # existing toast in place instead of stacking two notifications
+        # (see Bug 2 in tmp/review-round-1.md).
+        self._commit_run_id: str = ""
         # Wall-clock start of the current task in epoch milliseconds,
         # stamped by the VS Code ``task_runner`` just before the run
         # starts; read (via ``getattr`` with a 0 default) by
@@ -179,6 +186,15 @@ class WorktreeSorcarAgent(ChatSorcarAgent):
         re-staging).  Falls back to a generic commit message when the
         LLM-based message generator is unavailable.
 
+        Emits two best-effort UI notifications via
+        :meth:`_broadcast_commit_notification` when a printer with a
+        ``broadcast`` method is attached: ``"Generating commit
+        message"`` immediately before the (typically slow) LLM call
+        that produces the commit message, and ``"Committed
+        <subject>"`` once the commit lands in git.  The notifications
+        are routed by tab so they appear on the owning chat webview,
+        not on every open tab.
+
         Returns:
             True if a commit was created, False if nothing to commit.
         """
@@ -186,31 +202,138 @@ class WorktreeSorcarAgent(ChatSorcarAgent):
             return False
         if not self.auto_commit_enabled:
             return False
+        # Stash a single notification id for the whole
+        # ``auto_commit_changes`` lifecycle so both the "generating"
+        # and "committed" toasts share it (Bug 2 from gpt-5.5
+        # review).  Includes ``time.time_ns()`` so concurrent agents
+        # on the same tab (e.g. sub-agent sessions) don't collide.
+        self._commit_run_id = (
+            f"autocommit-{self._tab_id}-{time.time_ns()}"
+        )
         return auto_commit_changes(
             self._wt.wt_dir,
             self._last_user_prompt or None,
             _generate_commit_message,
+            notify_fn=self._broadcast_commit_notification,
         )
+
+    def _broadcast_commit_notification(self, stage: str, subject: str) -> None:
+        """Broadcast an auto-commit life-cycle notification to the webview.
+
+        Hook used by
+        :func:`~kiss.agents.sorcar.sorcar_agent.auto_commit_changes`:
+        ``stage="generating"`` arrives immediately before the LLM
+        call that generates the commit message; ``stage="committed"``
+        arrives immediately after a successful commit, with
+        *subject* set to the first non-empty line of the commit
+        message.  Other stage values are ignored.
+
+        Silently no-ops when no printer with a ``broadcast`` method
+        is attached (e.g. the printer-free unit-test path), and never
+        raises into the caller — broken UI plumbing must not block
+        the commit itself.
+
+        Args:
+            stage: ``"generating"`` or ``"committed"``.
+            subject: First non-empty line of the commit message
+                (used as the toast body for the ``"committed"``
+                stage; ignored for ``"generating"``).
+        """
+        printer = getattr(self, "printer", None)
+        if printer is None or not hasattr(printer, "broadcast"):
+            return
+        if stage == "generating":
+            message = "Generating commit message"
+        elif stage == "committed":
+            message = f"Committed {subject}" if subject else "Committed"
+        else:
+            return
+        # Share a single id across both lifecycle stages so the
+        # webview updates the existing toast in place ("Generating
+        # commit message" → "Committed <subject>") instead of stacking
+        # two toasts and leaving the "Generating" toast lingering
+        # until its own auto-dismiss timer fires (Bug 2, gpt-5.5
+        # round-1 review).
+        notification_id = self._commit_run_id or (
+            f"autocommit-{self._tab_id}-{time.time_ns()}"
+        )
+        # The ``"generating"`` toast must remain visible for the
+        # entire (potentially long) LLM-driven commit-message call —
+        # the webview's transient auto-dismiss timer (~5 s) would
+        # otherwise hide it mid-flight and mislead the user into
+        # thinking the commit had stalled.  Mark it ``sticky`` so
+        # ``scheduleNotificationDismiss`` short-circuits, and rely on
+        # the subsequent ``"committed"`` event (which reuses the same
+        # ``id`` but omits ``sticky``) to replace it with a regular
+        # transient toast that fades out normally.
+        event: dict[str, object] = {
+            "type": "notification",
+            "id": notification_id,
+            "severity": "info",
+            "message": message,
+            "tabId": self._tab_id,
+        }
+        if stage == "generating":
+            event["sticky"] = True
+        try:
+            printer.broadcast(event)
+        except Exception:  # pragma: no cover — best-effort UI hook
+            logger.debug("autocommit notification broadcast failed", exc_info=True)
 
 
     def _finalize_worktree(self) -> bool:
         """Auto-commit, remove worktree, prune.
 
+        After the LLM-driven auto-commit, a single-shot retry runs
+        :meth:`GitWorktreeOps.commit_all` with a generic message to
+        catch the very narrow remaining race where a file appears
+        between :func:`~kiss.agents.sorcar.sorcar_agent.auto_commit_changes`'s
+        second ``stage_all`` and its ``commit_staged`` call (e.g.
+        ``PROGRESS.md`` being rewritten, ``.DS_Store`` materializing
+        after an ``open`` of the report, an editor swap file
+        appearing).  Only if that retry STILL leaves uncommitted
+        state do we preserve the worktree and log a warning — and
+        that warning now includes the raw ``git status --porcelain``
+        leftover so an operator can distinguish a real pre-commit
+        rejection from a race leftover from a corrupt index without
+        sshing in.
+
         Returns:
             True if the worktree was cleaned up successfully.  False if
-            uncommitted changes remain after the auto-commit attempt
-            (e.g. a pre-commit hook rejected the commit) — the worktree
+            uncommitted changes remain after BOTH the auto-commit and
+            the late-arriver retry (e.g. a pre-commit hook rejected
+            the commit, or a third write landed in the microsecond
+            after the retry's own ``stage_all``) — the worktree
             directory is preserved so no work is lost.
         """
         assert self._wt is not None
         wt = self._wt
         if wt.wt_dir.exists():
             self._auto_commit_worktree()
+            # Single-shot retry: closes the residual race window
+            # between ``auto_commit_changes``'s second ``stage_all``
+            # and its ``commit_staged`` call.  ``commit_all`` is a
+            # no-op when nothing is uncommitted (its inner
+            # ``commit_staged`` short-circuits on an empty
+            # ``git diff --cached``), so it is safe to always invoke
+            # here — but skipping the call keeps the happy-path log
+            # quiet.
             if GitWorktreeOps.has_uncommitted_changes(wt.wt_dir):
+                GitWorktreeOps.commit_all(
+                    wt.wt_dir,
+                    "kiss: auto-commit late-arriving changes",
+                )
+            if GitWorktreeOps.has_uncommitted_changes(wt.wt_dir):
+                leftover = GitWorktreeOps.status_porcelain(wt.wt_dir)
                 logger.warning(
                     "Worktree has uncommitted changes after auto-commit "
-                    "(pre-commit hook may have rejected); preserving: %s",
+                    "and late-arriver retry (possible causes: a "
+                    "pre-commit hook rejected the commit, a real "
+                    "commit failure, or a concurrent write that "
+                    "outraced both staging passes); preserving %s\n"
+                    "git status --porcelain:\n%s",
                     wt.wt_dir,
+                    leftover,
                 )
                 return False
             GitWorktreeOps.remove(wt.repo_root, wt.wt_dir)
@@ -357,7 +480,10 @@ class WorktreeSorcarAgent(ChatSorcarAgent):
             self._merge_conflict_warning = (
                 f"Could not auto-commit worktree changes for "
                 f"'{wt.branch}' (a pre-commit hook may have rejected "
-                f"the commit). The worktree is preserved at: {wt.wt_dir}"
+                "the commit, the commit itself failed, or a "
+                "concurrent write outraced both staging passes — "
+                "see the kiss-web log for the exact leftover "
+                f"files). The worktree is preserved at: {wt.wt_dir}"
             )
             self._wt = None
             return None
@@ -854,45 +980,6 @@ class WorktreeSorcarAgent(ChatSorcarAgent):
         if delete_warning:
             return f"Partially discarded branch '{wt.branch}'.{checkout_warning}{delete_warning}"
         return f"Discarded branch '{wt.branch}'.{checkout_warning}"
-
-
-    def merge_instructions(self) -> str:
-        """Return human-readable merge/discard instructions.
-
-        Returns:
-            Multi-line string with merge and discard instructions.
-        """
-        if self._wt is None:
-            return "No pending worktree task."
-        wt = self._wt
-        orig = wt.original_branch or "<branch>"
-        merge_cmd = _manual_merge_cmd(wt)
-        return (
-            f"Task completed on branch: {wt.branch}\n"
-            "\nTo commit and merge:\n"
-            "    agent.merge()\n"
-            "\nTo discard:\n"
-            "    agent.discard()\n"
-            "\nOr manually:\n"
-            f"    cd {wt.repo_root}\n"
-            f"    git checkout {orig}\n"
-            f"    {merge_cmd}\n"
-            "    git commit\n"
-            f"    git branch -d {wt.branch}"
-        )
-
-
-    @staticmethod
-    def cleanup(repo_root: Path | str) -> str:
-        """Scan for orphaned ``kiss/wt-*`` branches and worktrees.
-
-        Args:
-            repo_root: Root of the git repository to scan.
-
-        Returns:
-            Summary of findings and any cleanup actions taken.
-        """
-        return GitWorktreeOps.cleanup_orphans(Path(repo_root))
 
 
 # Flags that only make sense in interactive (daemon-client) mode:

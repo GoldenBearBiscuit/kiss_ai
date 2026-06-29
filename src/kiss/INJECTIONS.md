@@ -1,30 +1,46 @@
 ## Trick
 
-Use internet search extensively.
+Search internet extensively.
 
 ## Trick
 
-Reproduce the issue by writing integration tests. Then fix the issue.
+Reproduce the issue by writing an integration test. Then fix the issue.
 
 ## Trick
 
-Reproduce the issue by writing end-to-end test. Then fix the issue.
+Reproduce the issue by writing an end-to-end test. Then fix the issue.
 
 ## Trick
 
-Use claude-opus-4-7 model for all tasks including coding, bug fixing, and test creation. Use gpt-5.5 model (not codex) for thorough review of the work done by the other model.
+Reproduce any violation of the ivariant by writing end-to-end tests. Then fix the issue.
 
 ## Trick
 
-can you review the updates made in the last task using gpt-5.5 (non codex) and claude-opus-4-7 thoroughly and then write end-to-end tests reproducing the bugs reported by the review, fix them, and test them using claude-opus-4-7? Run all the tests in parallel and fix bugs after reviewing the fixes with gpt-5.5 (non codex) and claude-opus-4-7. Repeat the process until you fail to reproduce the bugs reported by the review done by gpt-5.5 (non codex) and claude-opus-4-7.
+Use claude-opus-4-7 model for all tasks including coding, bug fixing, and test creation. Use gpt-5.5 model (not codex) for thorough review and debugging of the work done by the other model. Check if the other model has missed some code or has introduced bugs. No need to check if the models exist.
 
 ## Trick
 
-Use openrouter/z-ai/glm-5.2 model for all tasks including coding, bug fixing, and test creation. ALWAYS use gpt-5.5 model (not codex) and claude-opus-4-7 to carefully and thoroughly review the work done by openrouter/z-ai/glm-5.2.
+Can you review the updates made in the last task using gpt-5.5 (non codex) and find bugs or missing code. Then write end-to-end tests reproducing the bugs reported by the review, fix them, and test them using claude-opus-4-7? Run all the tests in parallel and fix bugs after thoroughly reviewing the fixes with gpt-5.5 (non codex). Repeat the process until you fail to reproduce the bugs reported by the review done by gpt-5.5 (non codex). No need to check if the models exist.
 
 ## Trick
 
-Can you create an html report with diagrams and illustrations in PWD/reports and open it in the user's default browser?
+Review the updates made in the current task using gpt-5.5 (non codex) and find bugs or missing code. Then write end-to-end tests reproducing the bugs reported by the review, fix them, and test them using claude-opus-4-7? Run all the tests in parallel and fix bugs after thoroughly reviewing the fixes with gpt-5.5 (non codex). Repeat the process until you fail to reproduce the bugs reported by the review done by gpt-5.5 (non codex). No need to check if the models exist.
+
+## Trick
+
+Use openrouter/z-ai/glm-5.2 model for all tasks including coding, bug fixing, and test creation. ALWAYS use gpt-5.5 model (not codex) to carefully and thoroughly review and debug the work done by openrouter/z-ai/glm-5.2 for bugs and missing code. Then use claude-opus-4-7 to do the same thing.
+
+## Trick
+
+Can you run all tests and report the cause of failing tests? Do not modify any code. Running all tests, collecting information, and fixing them is time consuming. So split the set of tests by the number of test methods into number of cores - 2 and run all splits in parallel using run_parallel tool.
+
+## Trick
+
+Can you check the following message on merge conflict and help me fix it?
+
+## Trick
+
+Can you create an html report with diagrams and illustrations in ./reports and open it in the user's default browser?
 
 ## Trick
 
@@ -36,12 +52,12 @@ git push origin
 
 ## Trick
 
-get rid of all commits after the following commit from both main and origin:
+Get rid of all commits after the following commit from both main and origin:
 
 ## Trick
 
-can you build the paper at
+Build the paper, and take screenshots to check and fix formatting.
 
 ## Trick
 
-Why did the last task get interrupted? Thoroughly and precisely analyze the logs and the events of the task. Reproduce the issue by writing an integration test. Then fix the issue.
+Why did the last task failed? Thoroughly and precisely analyze the logs and the events of the task. Reproduce the issue by writing an integration test. Then fix the issue.

@@ -178,7 +178,7 @@ def _coalesced_replay_events(events: object) -> list[dict[str, Any]]:
     return _coalesce_events(cast("list[dict[str, Any]]", events))
 
 
-def _live_task_id(tab: _RunningAgentState) -> int | None:
+def _live_task_id(tab: _RunningAgentState) -> str | None:
     """Return the live ``task_history`` row id for *tab*.
 
     Prefers ``tab.agent._last_task_id`` (set by the agent the moment it
@@ -242,7 +242,8 @@ def _subagent_is_done(sub_task_id: Any) -> bool:
     from kiss.agents.sorcar.chat_sorcar_agent import ChatSorcarAgent
 
     return not (
-        isinstance(sub_task_id, int)
+        isinstance(sub_task_id, str)
+        and sub_task_id
         and sub_task_id in ChatSorcarAgent.running_agents
     )
 
@@ -303,6 +304,12 @@ class VSCodeServer(
         # (see the C2/C3 note in ``_replay_session``).  Guarded by
         # ``_state_lock``.
         self._tab_chat_views: dict[str, str] = {}
+        # Maps ``id(user_answer_queue)`` to the task id of the currently
+        # pending ``ask_user_question`` that owns that queue.  ``userAnswer``
+        # uses this to close exactly the subscriber set for the task that
+        # consumed the answer; old completed-task subscriber sets are
+        # intentionally retained and must not receive unrelated close events.
+        self._pending_user_answer_tasks: dict[int, str] = {}
         persisted = _load_last_model()
         self._default_model = (
             persisted
@@ -357,7 +364,7 @@ class VSCodeServer(
         # a ``status:running`` event so the tab title shows the
         # blinking-green-circle "running" indicator.  ``None`` in
         # tests that construct ``VSCodeServer`` standalone.
-        self._cli_running_lookup: Callable[[int], bool] | None = None
+        self._cli_running_lookup: Callable[[str], bool] | None = None
         # Companion snapshot hook installed by ``RemoteAccessServer``
         # via :meth:`set_cli_running_task_ids_lookup`.  Returns the
         # full set of task ids the local ``sorcar`` CLI has announced
@@ -367,10 +374,10 @@ class VSCodeServer(
         # panel's pulsing-green-dot ``is_running`` flag is set on
         # CLI tasks too (the in-process ``_RunningAgentState``
         # registry only tracks UI-launched tasks).
-        self._cli_running_task_ids_lookup: Callable[[], set[int]] | None = None
+        self._cli_running_task_ids_lookup: Callable[[], set[str]] | None = None
 
     def set_cli_running_lookup(
-        self, lookup: Callable[[int], bool] | None,
+        self, lookup: Callable[[str], bool] | None,
     ) -> None:
         """Install the CLI-task running-lookup used by :meth:`_replay_session`.
 
@@ -386,7 +393,7 @@ class VSCodeServer(
         self._cli_running_lookup = lookup
 
     def set_cli_running_task_ids_lookup(
-        self, lookup: Callable[[], set[int]] | None,
+        self, lookup: Callable[[], set[str]] | None,
     ) -> None:
         """Install the CLI-running-task-id snapshot used by ``_get_history``.
 
@@ -422,19 +429,6 @@ class VSCodeServer(
             self._last_active_file.pop(conn_id, None)
             self._last_active_content.pop(conn_id, None)
             self._complete_seq_latest.pop(conn_id, None)
-
-    @property
-    def _running_agent_states(self) -> dict[str, _RunningAgentState]:
-        """Process-global running-agent-state dict.
-
-        Backward-compat accessor for existing test fixtures and audit
-        tests that read ``server._running_agent_states``.  The
-        canonical home is the class attribute
-        :attr:`kiss.agents.sorcar.running_agent_state._RunningAgentState.running_agent_states`;
-        production code inside this package accesses it directly via
-        :class:`_RunningAgentState`.
-        """
-        return _RunningAgentState.running_agent_states
 
     def _get_tab(self, tab_id: str) -> _RunningAgentState:
         """Get or create per-tab state for the given tab.
@@ -528,24 +522,6 @@ class VSCodeServer(
             self.printer.broadcast(event)
 
 
-    def broadcast_new_tab(self, task_id: int) -> None:
-        """Ask the frontend to open a fresh chat tab and resume ``task_id``.
-
-        The webview's ``new_tab`` handler allocates a new tab id
-        (frontend-only concept) via ``createNewTab`` and then posts a
-        ``resumeSession`` command back with the same ``task_id`` —
-        ``_cmd_resume_session`` accepts a task-id-only resume payload.
-
-        ``taskId=""`` keeps this a global system event so it reaches
-        every connected client; otherwise ``WebPrinter.broadcast``
-        would fan it out only to subscribers of the freshly-minted
-        task (of which there are none until the frontend has
-        received this broadcast and allocated the tab).
-        """
-        self.printer.broadcast(
-            {"type": "new_tab", "task_id": int(task_id), "taskId": ""},
-        )
-
     def _get_models(self, conn_id: str = "") -> None:
         """Send available models list with usage counts and pricing.
 
@@ -582,29 +558,53 @@ class VSCodeServer(
         if custom:
             models_list.insert(0, custom)
 
-        # On a fresh installation the server is constructed before any
-        # API key is configured, so ``self._default_model`` is the
-        # ``"No model"`` sentinel.  Once a key becomes available (env var
-        # or settings panel), ``get_available_models()`` returns real
-        # models, but the cached sentinel would keep the picker stuck on
-        # "No model".  Re-resolve the default whenever the cached
-        # selection is no longer a valid choice so the picker recovers.
+        # ``kiss-web`` can outlive VS Code windows.  A fresh VS Code
+        # activation asks this long-lived daemon for ``getModels``;
+        # if the user selected a different model in a previous window
+        # session, that choice is persisted in ``config.json`` and must
+        # take precedence over this process's stale in-memory default.
+        # Honor the persisted last model whenever it is still runnable.
         available_names = {m["name"] for m in models_list}
-        if self._default_model not in available_names:
-            refreshed = get_default_model()
-            if refreshed in available_names:
-                self._default_model = refreshed
+        with self._state_lock:
+            # Read the persisted last model INSIDE the lock so a
+            # concurrent ``_cmd_select_model`` (which now persists
+            # under the same lock) cannot leave us with a stale
+            # on-disk value that would clobber the user's just-picked
+            # in-memory selection.
+            persisted = _load_last_model()
+            if persisted in available_names:
+                self._default_model = persisted
+
+            # On a fresh installation the server is constructed before any
+            # API key is configured, so ``self._default_model`` is the
+            # ``"No model"`` sentinel.  Once a key becomes available (env var
+            # or settings panel), ``get_available_models()`` returns real
+            # models, but the cached sentinel would keep the picker stuck on
+            # "No model".  Re-resolve the default whenever the cached
+            # selection is no longer a valid choice so the picker recovers.
+            # If the only available option is a custom endpoint, the core
+            # default resolver cannot name it; choose the first available
+            # entry so the picker never emits a stale unavailable selection.
+            if self._default_model not in available_names:
+                refreshed = get_default_model()
+                if refreshed in available_names:
+                    self._default_model = refreshed
+                elif models_list:
+                    self._default_model = str(models_list[0]["name"])
+                else:
+                    self._default_model = refreshed
+            selected = self._default_model
 
         event: dict[str, Any] = {
             "type": "models",
             "models": models_list,
-            "selected": self._default_model,
+            "selected": selected,
         }
         if conn_id:
             event["connId"] = conn_id
         self.printer.broadcast(event)
 
-    def _get_running_task_ids(self) -> set[int]:
+    def _get_running_task_ids(self) -> set[str]:
         """Return the set of task_history row ids with alive worker threads.
 
         Scans all per-tab ``_RunningAgentState`` entries and collects
@@ -615,7 +615,7 @@ class VSCodeServer(
         Returns:
             Set of ``task_history.id`` values that are currently running.
         """
-        running: set[int] = set()
+        running: set[str] = set()
         with self._state_lock:
             for tab in _RunningAgentState.running_agent_states.values():
                 tid = _live_task_id(tab)
@@ -641,7 +641,7 @@ class VSCodeServer(
         return running
 
     def _overlay_live_metrics(
-        self, session: dict[str, Any], task_id: int,
+        self, session: dict[str, Any], task_id: str,
     ) -> None:
         """Replace persisted metrics with live agent data for a running task.
 
@@ -731,10 +731,19 @@ class VSCodeServer(
             has_events = bool(entry.get("has_events", False))
             chat_id = str(entry.get("chat_id", "") or "")
             result = str(entry.get("result", "") or "")
-            entry_id = entry.get("id")
-            is_running = (
-                isinstance(entry_id, int) and entry_id in running_task_ids
-            )
+            _raw_eid = entry.get("id")
+            # r4-vscode-H2 — accept legacy int task_ids from DBs that
+            # escaped auto-migration.  Coerce to str so the rest of
+            # the history pipeline (which assumes a string id) works
+            # uniformly.
+            entry_id: str | None
+            if isinstance(_raw_eid, str) and _raw_eid:
+                entry_id = _raw_eid
+            elif isinstance(_raw_eid, int) and _raw_eid:
+                entry_id = str(_raw_eid)
+            else:
+                entry_id = None
+            is_running = entry_id is not None and entry_id in running_task_ids
             session: dict[str, Any] = {
                 "id": chat_id,
                 "task_id": entry_id,
@@ -817,8 +826,13 @@ class VSCodeServer(
                     if isinstance(sub, dict):
                         session["is_subagent"] = True
                         pid = sub.get("parent_task_id")
-                        if isinstance(pid, int):
+                        # r3-vscode-H2: accept both UUID strings and
+                        # legacy int parent ids written by pre-UUID
+                        # task_history rows that escaped migration.
+                        if isinstance(pid, str) and pid:
                             session["parent_task_id"] = pid
+                        elif isinstance(pid, int) and pid:
+                            session["parent_task_id"] = str(pid)
                     # Field-by-field numeric coercion: garbage values
                     # fall back to the zero default, numeric strings
                     # round-trip through the cast.
@@ -869,7 +883,7 @@ class VSCodeServer(
             # so the history panel shows current steps/tokens/cost
             # instead of the stale persisted values (which are only
             # written at task completion).
-            if session.get("is_running") and isinstance(entry_id, int):
+            if session.get("is_running") and entry_id is not None:
                 self._overlay_live_metrics(session, entry_id)
             sessions.append(session)
         event: dict[str, Any] = {
@@ -880,7 +894,7 @@ class VSCodeServer(
             event["connId"] = conn_id
         self.printer.broadcast(event)
 
-    def _handle_delete_task(self, task_id: int) -> None:
+    def _handle_delete_task(self, task_id: str) -> None:
         """Delete a task and its associated events from the database
         and broadcast a ``taskDeleted`` event so any open chat tab
         that displays this task or its chat can prune its UI.
@@ -917,7 +931,7 @@ class VSCodeServer(
             "chatHasMoreTasks": _chat_has_tasks(chat_id),
         })
 
-    def _handle_set_favorite(self, task_id: int, is_favorite: bool) -> None:
+    def _handle_set_favorite(self, task_id: str, is_favorite: bool) -> None:
         """Persist the favourite flag on a task history row.
 
         Merges ``{"is_favorite": <bool>}`` into the row's ``extra``
@@ -1113,11 +1127,21 @@ class VSCodeServer(
             # disposed.  Mirror ``_replay_session``'s empty-id no-op.
             logger.debug("newChat ignored: empty tabId")
             return
-        persisted = _load_last_model()
-        if persisted:
-            self._default_model = persisted
         tab = self._get_tab(tab_id)
         with self._state_lock:
+            # Read the persisted last model INSIDE ``_state_lock`` so a
+            # concurrent ``_cmd_select_model`` (which now persists
+            # under the same lock) cannot leave us with a stale
+            # on-disk value that would clobber the user's just-picked
+            # in-memory selection.  Without this guard,
+            # ``_load_last_model()`` could read the OLD on-disk value
+            # mid-flight of ``_cmd_select_model``'s disk write, then
+            # ``self._default_model = persisted`` would revert the
+            # just-picked model both on the daemon-wide default AND
+            # on this new tab's ``selected_model``.
+            persisted = _load_last_model()
+            if persisted:
+                self._default_model = persisted
             tab.selected_model = self._default_model
             # Clear the long-lived chat identity for this tab; the
             # next ``_cmd_run`` will mint a fresh chat id when it
@@ -1130,6 +1154,13 @@ class VSCodeServer(
             # chat until ``_cmd_run`` mints one or ``_replay_session``
             # associates a resumed one.
             self._tab_chat_views.pop(tab_id, None)
+            # Snapshot the model under the lock so the ``showWelcome``
+            # broadcast below cannot disagree with the in-memory state
+            # captured for ``tab.selected_model`` above (a concurrent
+            # ``_cmd_select_model`` could otherwise mutate
+            # ``self._default_model`` between the lock release and the
+            # broadcast read).
+            welcome_model = self._default_model
         # Drop any live-task subscriptions this tab carried from the
         # chat it previously displayed (e.g. a still-running task it
         # was viewing via ``_reattach_running_chat``).  The webview now
@@ -1143,11 +1174,11 @@ class VSCodeServer(
         self.printer.broadcast({
             "type": "showWelcome",
             "tabId": tab_id,
-            "model": self._default_model,
+            "model": welcome_model,
         })
 
     def _replay_session(
-        self, chat_id: str, tab_id: str = "", task_id: int | None = None,
+        self, chat_id: str, tab_id: str = "", task_id: str | None = None,
     ) -> None:
         """Replay recorded chat events for a previous chat session.
 
@@ -1269,8 +1300,16 @@ class VSCodeServer(
         # ``chat_id``) is never matched when the user clicks a
         # sub-agent row.  When ``task_id`` is ``None`` (no specific
         # row, just a chat) the regular chat-id-based scan applies.
-        rebound_task_id = result.get("task_id") if result else None
-        if not isinstance(rebound_task_id, int):
+        _raw_rebound_tid = result.get("task_id") if result else None
+        rebound_task_id: str | None
+        if isinstance(_raw_rebound_tid, str) and _raw_rebound_tid:
+            rebound_task_id = _raw_rebound_tid
+        elif isinstance(_raw_rebound_tid, int) and _raw_rebound_tid:
+            # r4-vscode-H1 — accept legacy int payloads from DBs that
+            # escaped the auto-migration; mirror the same defence
+            # applied to ``parent_task_id`` in r3-vscode-H2.
+            rebound_task_id = str(_raw_rebound_tid)
+        else:
             rebound_task_id = None
         # The tab is navigating to (possibly) another chat: drop every
         # live-task subscription it carried from whatever it displayed
@@ -1426,9 +1465,17 @@ class VSCodeServer(
             # sub-agent tab (see ``closeTab`` in media/main.js, which
             # walks ``parentTabId`` chains).
             parent_tid_raw = subagent_info.get("parent_task_id")
-            parent_tid: int | None = (
-                parent_tid_raw if isinstance(parent_tid_raw, int) else None
-            )
+            # r3-vscode-H2: accept legacy int parent ids that may
+            # appear in DBs that escaped migration (extra JSON in a
+            # row that was never re-saved through the new typed
+            # column path).  Stringify rather than drop so the
+            # parent-tab resolver still has a value to match.
+            if isinstance(parent_tid_raw, str) and parent_tid_raw:
+                parent_tid: str | None = parent_tid_raw
+            elif isinstance(parent_tid_raw, int) and parent_tid_raw:
+                parent_tid = str(parent_tid_raw)
+            else:
+                parent_tid = None
             parent_tab_id_for_sub = self._resolve_parent_tab_id_for_sub(
                 parent_task_id=parent_tid,
                 chat_id=chat_id,
@@ -1519,7 +1566,11 @@ class VSCodeServer(
         # sub-agent row already converts the clicked tab into a
         # sub-agent tab via the ``subagent_info`` branch above; we
         # do NOT want to recursively reopen siblings on that path.
-        if subagent_info is None and isinstance(rebound_task_id, int):
+        if (
+            subagent_info is None
+            and isinstance(rebound_task_id, str)
+            and rebound_task_id
+        ):
             self._open_persisted_subagent_tabs(
                 parent_task_id=rebound_task_id, parent_tab_id=tab_id,
             )
@@ -1527,7 +1578,7 @@ class VSCodeServer(
     def _resolve_parent_tab_id_for_sub(
         self,
         *,
-        parent_task_id: int | None,
+        parent_task_id: str | None,
         chat_id: str,
         sub_tab_id: str,
     ) -> str:
@@ -1611,7 +1662,7 @@ class VSCodeServer(
         return ""
 
     def _open_persisted_subagent_tabs(
-        self, *, parent_task_id: int, parent_tab_id: str,
+        self, *, parent_task_id: str, parent_tab_id: str,
     ) -> None:
         """Broadcast ``openSubagentTab`` + ``task_events`` for every
         persisted sub-agent row whose parent is *parent_task_id*.
@@ -1674,7 +1725,7 @@ class VSCodeServer(
             })
 
     def _live_task_start_ms(
-        self, task_id: int | None, chat_id: str,
+        self, task_id: str | None, chat_id: str,
     ) -> int:
         """Return the start timestamp (ms since epoch) of a live task.
 
@@ -1720,7 +1771,7 @@ class VSCodeServer(
         chat_id: str,
         new_tab_id: str,
         *,
-        task_id: int | None = None,
+        task_id: str | None = None,
         is_subagent: bool = False,
     ) -> bool:
         """Subscribe *new_tab_id* to a still-running ``_RunningAgentState``
@@ -1839,7 +1890,7 @@ class VSCodeServer(
         self,
         task: str,
         result: str,
-        task_id: int | None,
+        task_id: str | None,
     ) -> None:
         """Generate and broadcast a follow-up suggestion in a background thread.
 
@@ -1899,7 +1950,7 @@ class VSCodeServer(
         return ""
 
     def _get_adjacent_task(
-        self, chat_id: str, task_id: int | None, direction: str, tab_id: str = "",
+        self, chat_id: str, task_id: str | None, direction: str, tab_id: str = "",
     ) -> None:
         """Send events for the adjacent task in the same chat session.
 

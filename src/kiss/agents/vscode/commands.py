@@ -145,6 +145,7 @@ class _CommandsMixin:
         _last_active_content: dict[str, str]
         _file_cache: dict[str, list[str]]
         _tab_chat_views: dict[str, str]
+        _pending_user_answer_tasks: dict[int, str]
 
         def _get_tab(self, tab_id: str) -> _RunningAgentState: ...
         def _run_task(self, cmd: dict[str, Any]) -> None: ...
@@ -173,7 +174,7 @@ class _CommandsMixin:
             conn_id: str = "",
         ) -> None: ...
         def _replay_session(
-            self, chat_id: str, tab_id: str = "", task_id: int | None = None,
+            self, chat_id: str, tab_id: str = "", task_id: str | None = None,
         ) -> None: ...
         def _finish_merge(
             self, tab_id: str = "", *, work_dir: str = "",
@@ -183,7 +184,7 @@ class _CommandsMixin:
         def _ensure_complete_worker(self) -> None: ...
         def _get_input_history(self, conn_id: str = "") -> None: ...
         def _get_adjacent_task(
-            self, chat_id: str, task_id: int | None, direction: str,
+            self, chat_id: str, task_id: str | None, direction: str,
             tab_id: str = "",
         ) -> None: ...
         def _generate_commit_message(
@@ -195,10 +196,10 @@ class _CommandsMixin:
         def _handle_autocommit_action(
             self, action: str, tab_id: str = "", *, work_dir: str = "",
         ) -> None: ...
-        def _handle_delete_task(self, task_id: int) -> None: ...
+        def _handle_delete_task(self, task_id: str) -> None: ...
         def _handle_delete_frequent_task(self, task: str) -> None: ...
         def _handle_set_favorite(
-            self, task_id: int, is_favorite: bool,
+            self, task_id: str, is_favorite: bool,
         ) -> None: ...
 
 
@@ -357,7 +358,18 @@ class _CommandsMixin:
             if not model:
                 return
             self._default_model = model
-        _record_model_usage(model)
+            # Persist the user's pick under the SAME critical section
+            # that updates ``self._default_model``.  A concurrent
+            # ``_get_models`` reads ``_load_last_model()`` (the
+            # persisted ``last_model`` from ``config.json``) inside
+            # ``_state_lock`` and applies it to ``self._default_model``
+            # — if the disk write happens AFTER releasing the lock,
+            # the racing refresh would observe the OLD on-disk value
+            # and clobber the just-picked in-memory selection.
+            # Persisting inside the lock guarantees that any
+            # ``_get_models`` that subsequently acquires the lock sees
+            # the new value on disk.
+            _record_model_usage(model)
 
     def _cmd_get_history(self, cmd: dict[str, Any]) -> None:
         """Send conversation history to the requesting connection only."""
@@ -385,7 +397,12 @@ class _CommandsMixin:
 
     def _cmd_delete_task(self, cmd: dict[str, Any]) -> None:
         """Delete a task from the database and refresh history."""
-        task_id = _parse_int(cmd.get("taskId"))
+        raw_task_id = cmd.get("taskId")
+        task_id = (
+            raw_task_id
+            if isinstance(raw_task_id, str) and raw_task_id
+            else None
+        )
         if task_id is not None:
             self._handle_delete_task(task_id)
 
@@ -397,7 +414,12 @@ class _CommandsMixin:
 
     def _cmd_set_favorite(self, cmd: dict[str, Any]) -> None:
         """Persist the favourite flag on a task history row."""
-        task_id = _parse_int(cmd.get("taskId"))
+        raw_task_id = cmd.get("taskId")
+        task_id = (
+            raw_task_id
+            if isinstance(raw_task_id, str) and raw_task_id
+            else None
+        )
         if task_id is None:
             return
         is_favorite = bool(cmd.get("isFavorite", False))
@@ -463,6 +485,7 @@ class _CommandsMixin:
             if q is None:
                 logger.debug("userAnswer dropped: no queue for tabId=%s", ans_tab)
                 return
+            answered_task_id = self._pending_user_answer_tasks.pop(id(q), "")
             while not q.empty():
                 try:
                     q.get_nowait()
@@ -478,6 +501,48 @@ class _CommandsMixin:
                 q.put_nowait(answer)
             except queue.Full:  # pragma: no cover — drained immediately above
                 pass
+        clear_tabs = self._user_answer_clear_tabs(ans_tab, answered_task_id)
+        for tab_id in clear_tabs:
+            self.printer.broadcast({"type": "askUserDone", "tabId": tab_id})
+
+    def _user_answer_clear_tabs(
+        self, ans_tab: str, answered_task_id: str,
+    ) -> list[str]:
+        """Return every tab whose ask-user modal should close.
+
+        A submitted answer resolves one pending question for exactly one
+        running task/chat, regardless of which subscribed tab supplied it.
+        Completed-task subscriber sets are intentionally retained for
+        post-task broadcasts, so closing every historic subscriber set
+        that contains ``ans_tab`` can dismiss an unrelated tab's current
+        question.  The pending-question registry records the task id that
+        owns the queue which consumed this answer; only that task's
+        subscribers receive ``askUserDone``.
+
+        Args:
+            ans_tab: Frontend tab id carried by the ``userAnswer``
+                command.
+            answered_task_id: Task id associated with the live
+                ``ask_user_question`` that consumed the answer.
+
+        Returns:
+            Stable list of tab ids to receive ``askUserDone``.
+        """
+        if not ans_tab:
+            return []
+        if not answered_task_id:
+            return [ans_tab]
+        printer_lock = getattr(self.printer, "_lock", None)
+        subs_map = getattr(self.printer, "_subscribers", {})
+        if printer_lock is None:
+            return [ans_tab]
+        task_key = self.printer._coerce_task_id(answered_task_id)
+        with printer_lock:
+            viewers = list(subs_map.get(task_key, ()))
+        tabs = {str(v) for v in viewers if v}
+        if not tabs:
+            tabs.add(ans_tab)
+        return sorted(tabs)
 
     def _resolve_user_answer_queue(
         self, ans_tab: str,
@@ -625,7 +690,12 @@ class _CommandsMixin:
         """
         raw_id = cmd.get("chatId")
         chat_id = str(raw_id) if raw_id else ""
-        task_id = _parse_int(cmd.get("taskId"))
+        raw_task_id = cmd.get("taskId")
+        task_id = (
+            raw_task_id
+            if isinstance(raw_task_id, str) and raw_task_id
+            else None
+        )
         if chat_id or task_id is not None:
             self._replay_session(
                 chat_id, cmd.get("tabId", ""), task_id=task_id,
@@ -735,10 +805,11 @@ class _CommandsMixin:
             if not chat_id:
                 chat_id = self._tab_chat_views.get(tab_id, "")
         raw_task_id = cmd.get("taskId")
-        try:
-            task_id = int(raw_task_id) if raw_task_id is not None else None
-        except (TypeError, ValueError):
-            task_id = None
+        task_id = (
+            raw_task_id
+            if isinstance(raw_task_id, str) and raw_task_id
+            else None
+        )
         self._get_adjacent_task(
             chat_id,
             task_id,

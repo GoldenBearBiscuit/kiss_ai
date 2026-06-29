@@ -17,6 +17,139 @@
   }
 
   /**
+   * Format an elapsed duration in milliseconds for the per-panel time
+   * footer: ``"850ms"`` below one second, ``"3.4s"`` below one minute,
+   * ``"1m 12.0s"`` otherwise.
+   */
+  function fmtElapsedMs(ms) {
+    const n = Math.max(0, Math.round(Number(ms) || 0));
+    if (n < 1000) return n + 'ms';
+    const s = n / 1000;
+    if (s < 60) return s.toFixed(1) + 's';
+    const m = Math.floor(s / 60);
+    const sec = (s - m * 60).toFixed(1);
+    return m + 'm ' + sec + 's';
+  }
+
+  // Set of in-progress panel elements currently being stamped with a
+  // live ``.panel-time`` footer.  Populated by ``stampPanelStart`` and
+  // drained by ``finalizePanelTime``.  A single 1-second interval
+  // (``_activePanelTickIv``) walks this set and re-renders each
+  // panel's footer so the user sees the elapsed time update every
+  // second while the panel is still active.  Without this loop the
+  // footer would only appear/refresh when the panel closes — which is
+  // the bug we are fixing.
+  const _activePanels = new Set();
+  let _activePanelTickIv = null;
+
+  /**
+   * Stamp a panel element with its creation time (``data-start-ms``).
+   *
+   * No-op if the panel already carries a start stamp or if we are
+   * currently replaying persisted events (``_deferHighlight`` is set
+   * only during ``replayEventsInto``).  Replayed events arrive
+   * back-to-back so per-panel wall-clock measurements would be
+   * meaningless; we deliberately skip stamping then.
+   *
+   * In addition to stamping, the panel is registered with the live
+   * 1-second ticker so its ``.panel-time`` footer starts rendering
+   * immediately and refreshes every second while the panel is active.
+   */
+  function stampPanelStart(el) {
+    if (!el || _deferHighlight) return;
+    if (el.dataset.startMs) return;
+    el.dataset.startMs = String(Date.now());
+    _activePanels.add(el);
+    _renderPanelTime(el);
+    _startActivePanelTick();
+  }
+
+  /**
+   * Render (create or refresh) the ``.panel-time`` footer for ``el``
+   * using its ``data-start-ms`` stamp.  Shared by the live 1-second
+   * ticker and by ``finalizePanelTime`` so the in-progress footer and
+   * the final footer use identical anchoring/formatting logic.
+   *
+   * No-op if the panel was never stamped (e.g. replayed events) so the
+   * historical view stays clean.
+   */
+  function _renderPanelTime(el) {
+    if (!el) return;
+    const startMs = Number(el.dataset.startMs || 0);
+    if (!startMs) return;
+    const ms = Date.now() - startMs;
+    let footer = null;
+    // Find an existing direct-child footer (avoid matching footers
+    // inside nested panels).
+    for (let i = el.children.length - 1; i >= 0; i--) {
+      const c = el.children[i];
+      if (c.classList && c.classList.contains('panel-time')) {
+        footer = c;
+        break;
+      }
+    }
+    if (!footer) {
+      footer = document.createElement('div');
+      footer.className = 'panel-time';
+      el.appendChild(footer);
+    } else if (footer !== el.lastElementChild) {
+      // Keep the footer anchored as the LAST child so it always
+      // renders visually at the bottom of the panel, even when later
+      // content (e.g. a tool_result bash-panel) is appended after the
+      // initial finalisation.
+      el.appendChild(footer);
+    }
+    footer.textContent = fmtElapsedMs(ms);
+  }
+
+  /**
+   * Start the shared 1-second interval that re-renders the
+   * ``.panel-time`` footer of every panel still in ``_activePanels``.
+   * Idempotent: a no-op if the interval is already running or if no
+   * panels are active.  Each tick prunes panels that are no longer
+   * connected to the DOM so detached panels don't keep the loop alive
+   * forever, and stops the interval once the active set is empty.
+   */
+  function _startActivePanelTick() {
+    if (_activePanelTickIv) return;
+    if (_activePanels.size === 0) return;
+    _activePanelTickIv = setInterval(() => {
+      for (const el of Array.from(_activePanels)) {
+        if (!el || !el.isConnected) {
+          _activePanels.delete(el);
+          continue;
+        }
+        _renderPanelTime(el);
+      }
+      if (_activePanels.size === 0) {
+        clearInterval(_activePanelTickIv);
+        _activePanelTickIv = null;
+      }
+    }, 1000);
+  }
+
+  /**
+   * Append (or refresh) the final "time spent" footer as the LAST
+   * child of the given panel, then deregister the panel from the live
+   * ticker so its footer freezes at the closing time.  Reads
+   * ``data-start-ms`` set by ``stampPanelStart``.
+   *
+   * No-op if the panel was never stamped (e.g. replayed events), so
+   * the historical view stays clean.
+   */
+  function finalizePanelTime(el) {
+    if (!el) return;
+    const startMs = Number(el.dataset.startMs || 0);
+    if (!startMs) return;
+    _renderPanelTime(el);
+    _activePanels.delete(el);
+    if (_activePanels.size === 0 && _activePanelTickIv) {
+      clearInterval(_activePanelTickIv);
+      _activePanelTickIv = null;
+    }
+  }
+
+  /**
    * Sanitize an HTML string before assigning to innerHTML.
    *
    * Strips dangerous tags (script/iframe/object/embed/form/meta/link/style/
@@ -75,6 +208,258 @@
     return t.innerHTML;
   }
 
+  const notificationTimers = new Map();
+
+  function ensureNotificationContainer() {
+    let container = document.getElementById('kiss-notification-container');
+    if (!container) {
+      container = document.createElement('section');
+      container.id = 'kiss-notification-container';
+      container.className = 'kiss-notification-container';
+      container.setAttribute('aria-label', 'KISS Sorcar notifications');
+      document.body.appendChild(container);
+    }
+    let liveRegion = document.getElementById('kiss-notification-live-region');
+    if (!liveRegion) {
+      liveRegion = document.createElement('div');
+      liveRegion.id = 'kiss-notification-live-region';
+      liveRegion.className = 'kiss-sr-only';
+      liveRegion.setAttribute('role', 'status');
+      liveRegion.setAttribute('aria-live', 'polite');
+      liveRegion.setAttribute('aria-atomic', 'true');
+      document.body.appendChild(liveRegion);
+    }
+    return container;
+  }
+
+  function notificationIcon(severity) {
+    if (severity === 'error') return '\u2715';
+    if (severity === 'warning') return '\u26A0';
+    return '\u2139';
+  }
+
+  function notificationTitle(severity) {
+    if (severity === 'error') return 'Error';
+    if (severity === 'warning') return 'Warning';
+    return 'Information';
+  }
+
+  function clearNotificationTimer(id) {
+    const timer = notificationTimers.get(id);
+    if (timer) clearTimeout(timer);
+    notificationTimers.delete(id);
+  }
+
+  function notificationSelector(id) {
+    return (
+      '.kiss-notification[data-notification-id="' +
+      String(id).replace(/\\/g, '\\\\').replace(/"/g, '\\"') +
+      '"]'
+    );
+  }
+
+  function removeNotification(id, action, notifyExtension) {
+    clearNotificationTimer(id);
+    const toast = document.querySelector(notificationSelector(id));
+    if (toast && toast.parentNode) toast.parentNode.removeChild(toast);
+    if (notifyExtension) {
+      vscode.postMessage({type: 'notificationAction', id: id, action: action});
+    }
+  }
+
+  function scheduleNotificationDismiss(id, severity, sticky) {
+    clearNotificationTimer(id);
+    if (sticky) return;
+    const delay =
+      severity === 'error' ? 7500 : severity === 'warning' ? 6000 : 5000;
+    notificationTimers.set(
+      id,
+      setTimeout(() => removeNotification(id, undefined, false), delay),
+    );
+  }
+
+  function showNotification(ev) {
+    const container = ensureNotificationContainer();
+    const id = ev.id || String(Date.now());
+    let toast = container.querySelector(notificationSelector(id));
+    const severity = ev.severity || 'info';
+    const actions = Array.isArray(ev.actions) ? ev.actions : [];
+    const hasLocalActions = actions.some(
+      action =>
+        action &&
+        typeof action === 'object' &&
+        !Array.isArray(action) &&
+        typeof action.onClick === 'function',
+    );
+    const notifyOnClose = actions.length > 0 && !hasLocalActions;
+    const sticky = !!ev.sticky || actions.length > 0 || !!ev.progress;
+    if (!toast) {
+      toast = document.createElement('article');
+      toast.className = 'kiss-notification';
+      toast.dataset.notificationId = String(id);
+      toast.tabIndex = -1;
+      container.insertBefore(toast, container.firstChild);
+      toast.addEventListener('mouseenter', () => clearNotificationTimer(id));
+      toast.addEventListener('focusin', () => clearNotificationTimer(id));
+      toast.addEventListener('mouseleave', () => {
+        const state = toast.kissNotificationState || {
+          id: id,
+          severity: 'info',
+          sticky: false,
+        };
+        scheduleNotificationDismiss(state.id, state.severity, state.sticky);
+      });
+      toast.addEventListener('focusout', () => {
+        const state = toast.kissNotificationState || {
+          id: id,
+          severity: 'info',
+          sticky: false,
+        };
+        scheduleNotificationDismiss(state.id, state.severity, state.sticky);
+      });
+    }
+    toast.kissNotificationState = {id: id, severity: severity, sticky: sticky};
+    toast.className = 'kiss-notification kiss-notification-' + severity;
+    // Expose `sticky` on the DOM so downstream tests (and any future
+    // a11y tooling) can verify that a notification will not auto-
+    // dismiss — the existing `scheduleNotificationDismiss` already
+    // honours it for the timer, but the flag was otherwise invisible
+    // from the rendered DOM.
+    toast.dataset.notificationSticky = sticky ? 'true' : 'false';
+    toast.setAttribute('role', severity === 'error' ? 'alert' : 'status');
+    toast.setAttribute(
+      'aria-label',
+      notificationTitle(severity) + ': ' + (ev.message || ''),
+    );
+
+    const body = document.createElement('div');
+    body.className = 'kiss-notification-body';
+    const icon = document.createElement('div');
+    icon.className = 'kiss-notification-icon';
+    icon.setAttribute('aria-hidden', 'true');
+    icon.textContent = notificationIcon(severity);
+    const content = document.createElement('div');
+    content.className = 'kiss-notification-content';
+    const title = document.createElement('div');
+    title.className = 'kiss-notification-title';
+    title.textContent = notificationTitle(severity);
+    const message = document.createElement('div');
+    message.className = 'kiss-notification-message';
+    message.textContent = ev.message || '';
+    content.appendChild(title);
+    content.appendChild(message);
+    if (ev.progress && ev.progressMessage) {
+      const progress = document.createElement('div');
+      progress.className = 'kiss-notification-progress-message';
+      progress.textContent = ev.progressMessage;
+      content.appendChild(progress);
+    }
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'kiss-notification-close';
+    closeBtn.setAttribute('aria-label', 'Dismiss notification');
+    closeBtn.textContent = '\u00d7';
+    closeBtn.addEventListener('click', () =>
+      removeNotification(id, undefined, notifyOnClose),
+    );
+    body.appendChild(icon);
+    body.appendChild(content);
+    body.appendChild(closeBtn);
+    toast.replaceChildren(body);
+    if (ev.progress) {
+      const progressBar = document.createElement('div');
+      progressBar.className = 'kiss-notification-progress';
+      progressBar.setAttribute('aria-hidden', 'true');
+      toast.appendChild(progressBar);
+    }
+    if (actions.length > 0) {
+      const actionRow = document.createElement('div');
+      actionRow.className = 'kiss-notification-actions';
+      actions.forEach(action => {
+        // Each action is either a plain string label OR an object of
+        // shape ``{label, svg?, ariaLabel?, onClick?}``.  The object
+        // form is used by in-webview callers (e.g. the permanent
+        // "update available" notification) that want to render an
+        // inline ``<svg>`` icon inside the button and/or run a local
+        // click handler instead of round-tripping through the
+        // extension via ``notificationAction``.
+        const isObj =
+          action && typeof action === 'object' && !Array.isArray(action);
+        const label = isObj ? String(action.label || '') : String(action);
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'kiss-notification-action';
+        if (isObj && action.svg) {
+          // Parse + sanitise the SVG XML in an off-DOM template, then
+          // adopt the resulting SVG element.  This guarantees the
+          // browser parses it as SVG (correct namespace) and that
+          // ``kissSanitize`` strips any ``<script>``/``on*``/javascript:
+          // payload that may have slipped in.
+          const cleaned = kissSanitize(String(action.svg));
+          const parser = new window.DOMParser();
+          const doc = parser.parseFromString(cleaned, 'image/svg+xml');
+          const svgEl = doc.documentElement;
+          // DOMParser returns a ``<parsererror>`` element on invalid
+          // input — only adopt real SVG roots so we never inject
+          // arbitrary error HTML into the button.
+          if (
+            svgEl &&
+            svgEl.namespaceURI === 'http://www.w3.org/2000/svg' &&
+            svgEl.localName === 'svg'
+          ) {
+            svgEl.setAttribute('class', 'kiss-notification-action-icon');
+            svgEl.setAttribute('aria-hidden', 'true');
+            button.appendChild(document.importNode(svgEl, true));
+          }
+        }
+        if (label) {
+          const labelEl = document.createElement('span');
+          labelEl.className = 'kiss-notification-action-label';
+          labelEl.textContent = label;
+          button.appendChild(labelEl);
+        }
+        if (isObj && action.ariaLabel) {
+          button.setAttribute('aria-label', String(action.ariaLabel));
+        } else if (label) {
+          button.setAttribute('aria-label', label);
+        }
+        button.addEventListener('click', () => {
+          if (isObj && typeof action.onClick === 'function') {
+            try {
+              action.onClick();
+            } catch (_err) {
+              // Swallow handler errors so the notification still
+              // closes — the click already dismissed it from the
+              // user's point of view.
+            }
+            removeNotification(id, undefined, false);
+            return;
+          }
+          removeNotification(id, isObj ? label : action, true);
+        });
+        actionRow.appendChild(button);
+      });
+      toast.appendChild(actionRow);
+    }
+    const liveRegion = document.getElementById('kiss-notification-live-region');
+    if (liveRegion) {
+      liveRegion.textContent = '';
+      setTimeout(() => {
+        liveRegion.textContent =
+          notificationTitle(severity) + ': ' + (ev.message || '');
+      }, 0);
+    }
+    scheduleNotificationDismiss(id, severity, sticky);
+  }
+
+  function updateNotification(ev) {
+    if (ev.close) {
+      removeNotification(ev.id, undefined, false);
+      return;
+    }
+    showNotification(ev);
+  }
+
   // State — isRunning mirrors the active tab's tab.isRunning for UI controls
   let isRunning = false;
   let selectedModel = '';
@@ -116,6 +501,22 @@
   let historyLoading = false;
   let historyHasMore = true;
   let historyGeneration = 0;
+  // Session-scoped sets tracking the live running→completed
+  // transition for the History panel's status dot.  The invariant:
+  //   * A running row renders the pulsing green dot.
+  //   * On completion, the dot becomes SOLID green and STAYS that
+  //     way for the rest of the page session, even across
+  //     ``refreshHistory()`` reloads.
+  //   * A completed row that we never saw running in this session
+  //     (e.g. on a fresh history load) renders NO dot.
+  // ``historyLastRunningTaskIds`` is the snapshot of which task_ids
+  // were rendered as ``is_running:true`` on the previous
+  // ``renderHistory`` call.  When the next render drops a task_id
+  // (it transitioned to is_running:false / failed:false), we move
+  // it into ``historyJustCompletedTaskIds``, which sticks until the
+  // page is reloaded.
+  const historyLastRunningTaskIds = new Set();
+  const historyJustCompletedTaskIds = new Set();
 
   // Adjacent task scroll state (Cursor-style chat thread navigation)
   // Tab.id is a frontend-only UUID string; chat_id is an int assigned by the DB.
@@ -222,6 +623,13 @@
     return tabs.find(t => t.id === id) || null;
   }
 
+  /** Find the local tab that already displays a backend chat id. */
+  function getTabByBackendChatId(chatId) {
+    if (chatId === undefined || chatId === null || chatId === '') return null;
+    const key = String(chatId);
+    return tabs.find(t => String(t.backendChatId || '') === key) || null;
+  }
+
   /**
    * Place *subTab* immediately to the RIGHT of its parent tab — after
    * any sub-agent tabs of the same parent already sitting there — so
@@ -254,6 +662,7 @@
     hdr.textContent = 'Thoughts';
     addCollapse(panel, hdr);
     panel.appendChild(hdr);
+    stampPanelStart(panel);
     return panel;
   }
 
@@ -749,6 +1158,46 @@
    * "focus the existing tab keyed by this id" shortcut would only
    * be correct for a single-client setup.
    */
+  /**
+   * Materialise a sub-agent tab in the background — without changing
+   * ``activeTabId`` and without any of the side effects that
+   * ``createNewTab`` triggers for a user-initiated new chat
+   * (``saveCurrentTab``/``restoreTab`` DOM swap, ``newChat`` and
+   * ``getWelcomeSuggestions`` posts to the backend, focus theft).
+   *
+   * Called from the new_tab message handler when the backend's
+   * broadcast carries a ``parent_tab_id`` — i.e. when the new tab is
+   * a sub-agent tab spawned under a ``run_parallel`` call.  The
+   * sub-agent run shares the parent's ``chat_id`` so minting a fresh
+   * backend chat (which ``createNewTab`` does via ``newChat``) would
+   * be incorrect.
+   *
+   * The fresh tab is anchored immediately to the right of its parent
+   * via ``placeSubagentTabAfterParent`` so the tab bar reads
+   * parent → sub-agents left-to-right.  Returns the new tab object;
+   * callers use ``returned.id`` to address it in subsequent
+   * ``resumeSession`` posts.
+   */
+  function createBackgroundSubagentTab(parentId) {
+    const subTab = makeTab('new chat');
+    if (parentId) subTab.parentTabId = parentId;
+    // Mark the tab as a sub-agent tab immediately so the brief window
+    // between this ``new_tab`` and the follow-up ``openSubagentTab``
+    // event is consistent with the tab's final identity.  In
+    // particular, ``persistTabState`` filters sub-agent tabs out of
+    // the persisted set (they are reopened by the parent's
+    // ``resumeSession`` flow on restart — see
+    // ``_open_persisted_subagent_tabs`` in server.py).  Without this
+    // flag a window reload landing inside the
+    // ``new_tab → openSubagentTab`` window would persist a stray
+    // regular tab with no backend chat id.
+    subTab.isSubagentTab = true;
+    placeSubagentTabAfterParent(subTab, parentId);
+    renderTabBar();
+    persistTabState();
+    return subTab;
+  }
+
   function createNewTab() {
     // Preserve any typed text so it carries over to the new tab
     const pendingText = inp.value || '';
@@ -816,6 +1265,12 @@
         chatId: t.id,
         backendChatId: t.backendChatId || '',
         parentTabId: t.parentTabId || '',
+        // Persist the tab's pinned work_dir so a window reload that
+        // restores the tab keeps the same effective work_dir even
+        // before ``resumeSession`` replays ``task_events`` (and even
+        // for older persisted rows whose ``extra`` carries no
+        // ``work_dir``).  See INVARIANTS.md → Tabs & chat webview.
+        workDir: t.workDir || '',
       };
     });
     let activeIdx = persistable.findIndex(t => {
@@ -839,10 +1294,26 @@
   }
 
   // Initialize tabs — restore from saved state if available, else create one default tab
+  // Race-fix: seed the closure-scoped ``selectedModel`` from the DOM
+  // BEFORE the launch IIFE creates any tab.  ``makeTab`` reads the
+  // closure variable to populate ``tab.selectedModel``; without this
+  // seeding every tab built during init (including the ones restored
+  // from ``vscode.getState()``) records ``''`` and the picker turns
+  // blank on the next tab switch — even though ``#model-name`` shows
+  // the correct template value on launch and the daemon's ``models``
+  // event later updates the live label.
+  {
+    const _initialModelEl = document.getElementById('model-name');
+    if (_initialModelEl && _initialModelEl.textContent) {
+      selectedModel = _initialModelEl.textContent;
+    }
+  }
+
   (function () {
     const saved = vscode.getState();
     if (saved && saved.tabs && saved.tabs.length > 0) {
       tabs = [];
+      const restoredBackendChatIds = new Set();
       saved.tabs.forEach(st => {
         // Sub-agent tabs (persisted by older versions of
         // persistTabState) are dropped: they cannot be resumed by
@@ -851,11 +1322,27 @@
         // sub-agent row, with the row's own events, right of the
         // parent.
         if (st.isSubagentTab) return;
+        const persistedBackendChatId = st.backendChatId
+          ? String(st.backendChatId)
+          : '';
+        if (
+          persistedBackendChatId &&
+          restoredBackendChatIds.has(persistedBackendChatId)
+        ) {
+          return;
+        }
         const tab = makeTab(st.title);
         // Restore tab.id from persisted chatId (frontend tab identifier)
         if (st.chatId) tab.id = st.chatId;
-        if (st.backendChatId) tab.backendChatId = st.backendChatId;
+        if (persistedBackendChatId) {
+          tab.backendChatId = persistedBackendChatId;
+          restoredBackendChatIds.add(persistedBackendChatId);
+        }
         if (st.parentTabId) tab.parentTabId = st.parentTabId;
+        // Restore the tab's pinned work_dir (see persistTabState).
+        // Survives a settings-panel change made before the next
+        // ``resumeSession`` replay re-pins it from ``extra.work_dir``.
+        if (st.workDir) tab.workDir = st.workDir;
         tabs.push(tab);
       });
     }
@@ -934,6 +1421,15 @@
   const demoToggleBtn = document.getElementById('cfg-demo-mode');
   const updateBtn = document.getElementById('cfg-update-btn');
   const serverResetBtn = document.getElementById('cfg-server-reset-btn');
+  const serverResetConfirmModal = document.getElementById(
+    'server-reset-confirm-modal',
+  );
+  const serverResetConfirmOkBtn = document.getElementById(
+    'server-reset-confirm-ok',
+  );
+  const serverResetConfirmCancelBtn = document.getElementById(
+    'server-reset-confirm-cancel',
+  );
   const autocommitToggleBtn = document.getElementById('cfg-auto-commit');
   const taskPanel = document.getElementById('task-panel');
   const taskPanelText = document.getElementById('task-panel-text');
@@ -1450,6 +1946,102 @@
     return e;
   }
 
+  // ------------------------------------------------------------------
+  // Filepath linkifier — walks every text node under ``root`` and
+  // wraps slash-bearing tokens that look like absolute paths
+  // (``/foo/bar``), home-relative paths (``~/foo``), dot-relative
+  // paths (``./foo``, ``../foo``), or workspace-relative paths with
+  // at least one directory component (``src/foo``) — with optional
+  // ``:line`` suffix — in a ``<span class="kiss-filelink"
+  // data-path="...">``.  The existing global click handler (see
+  // bottom of this file) dispatches on ``[data-path]`` to post an
+  // ``openFile`` message to the extension, which validates the path
+  // and dispatches it to the VS Code editor or the native viewer.
+  //
+  // We skip text nodes inside ``<a>`` (already a hyperlink — marked
+  // autolinks URLs) and inside any element that already carries a
+  // ``data-path`` attribute (e.g. the existing tool_call ``.tp``
+  // hooks).  The leading character class lookbehind avoids matching
+  // a URL's path component (``https://x/y``) as a filepath: the
+  // character before ``/y`` is the alphanumeric host suffix, which
+  // ``\w`` rejects.
+  //
+  // The path regex deliberately requires at least one ``/`` so bare
+  // filenames like ``package.json`` — which would noise-up sentences
+  // and ambiguous tokens like ``v1.0`` — are NOT linkified.  Trailing
+  // sentence punctuation (``,``, ``.``, ``;``, ``)``, ``]``) is
+  // excluded by the closing character class so ``/tmp/foo.py,`` is
+  // captured as ``/tmp/foo.py``.
+  const _LINK_FILEPATH_RE =
+    /(?<![\w@:%/.~-])((?:(?:~|\.{1,2})?\/|[A-Za-z0-9_+-]+\/)[A-Za-z0-9_./+-]*[A-Za-z0-9_+/-](?::\d+)?)/g;
+  const _LINK_SKIP_TAGS = new Set([
+    'A',
+    'SCRIPT',
+    'STYLE',
+    'TEXTAREA',
+    'INPUT',
+    'BUTTON',
+    'SELECT',
+  ]);
+
+  function linkifyFilePaths(root) {
+    if (!root || root.nodeType !== 1) return;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        let p = node.parentNode;
+        while (p && p !== root.parentNode) {
+          if (p.nodeType === 1) {
+            if (_LINK_SKIP_TAGS.has(p.tagName)) {
+              return NodeFilter.FILTER_REJECT;
+            }
+            if (p.dataset && p.dataset.path) {
+              return NodeFilter.FILTER_REJECT;
+            }
+          }
+          p = p.parentNode;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    });
+    const matches = [];
+    let n;
+    while ((n = walker.nextNode())) {
+      const text = n.nodeValue;
+      if (!text || text.indexOf('/') < 0) continue;
+      _LINK_FILEPATH_RE.lastIndex = 0;
+      if (_LINK_FILEPATH_RE.test(text)) {
+        matches.push(n);
+      }
+    }
+    for (const node of matches) {
+      const text = node.nodeValue;
+      _LINK_FILEPATH_RE.lastIndex = 0;
+      const frag = node.ownerDocument.createDocumentFragment();
+      let last = 0;
+      let m;
+      while ((m = _LINK_FILEPATH_RE.exec(text)) !== null) {
+        const start = m.index;
+        const end = start + m[1].length;
+        if (start > last) {
+          frag.appendChild(
+            node.ownerDocument.createTextNode(text.slice(last, start)),
+          );
+        }
+        const span = node.ownerDocument.createElement('span');
+        span.className = 'kiss-filelink';
+        span.setAttribute('data-path', m[1]);
+        span.title = 'Open ' + m[1];
+        span.textContent = m[1];
+        frag.appendChild(span);
+        last = end;
+      }
+      if (last < text.length) {
+        frag.appendChild(node.ownerDocument.createTextNode(text.slice(last)));
+      }
+      if (node.parentNode) node.parentNode.replaceChild(frag, node);
+    }
+  }
+
   function hlBlock(el) {
     if (typeof hljs === 'undefined') return;
     el.querySelectorAll('pre code').forEach(bl => {
@@ -1593,6 +2185,87 @@
         collapsePreview(panels[i]);
       }
     }
+  }
+
+  function splitMultiSessionSummary(summary) {
+    const text = typeof summary === 'string' ? summary : '';
+    const finalMarker = '\n\n---\n\n### Final Session\n';
+    let markerIdx = text.indexOf(finalMarker);
+    let markerLen = finalMarker.length;
+    if (markerIdx <= 0) {
+      const separator = '\n\n---\n\n';
+      markerIdx = text.lastIndexOf(separator);
+      markerLen = separator.length;
+    }
+    if (markerIdx <= 0) return null;
+    const previous = text.substring(0, markerIdx).trim();
+    const final = text.substring(markerIdx + markerLen).trim();
+    if (!previous || !final) return null;
+    if (!previous.includes('### Previous Session')) return null;
+    return {previous: previous, final: final};
+  }
+
+  function removeResultPanels(container) {
+    if (!container || !container.children) return;
+    for (let i = container.children.length - 1; i >= 0; i--) {
+      const child = container.children[i];
+      if (child.classList && child.classList.contains('rc')) child.remove();
+    }
+  }
+
+  function createResultPanel(ev, summaryOverride, titleOverride, showStatus) {
+    const rc = mkEl('div', 'ev rc');
+    let rb = '';
+    let rawBody = '';
+    if (showStatus && ev.is_continue) {
+      rb +=
+        '<div style="color:var(--yellow);font-weight:700;font-size:var(--fs-xl);margin-bottom:10px">Status: Continue</div>';
+      rawBody += 'Status: Continue\n\n';
+    } else if (showStatus && ev.success === false) {
+      rb +=
+        '<div style="color:var(--red);font-weight:700;font-size:var(--fs-xl);margin-bottom:10px">Status: FAILED</div>';
+      rawBody += 'Status: FAILED\n\n';
+    }
+    let usePre = true;
+    const summaryText =
+      summaryOverride !== undefined ? summaryOverride : ev.summary;
+    if (summaryText) {
+      const sum = String(summaryText)
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+      if (typeof marked !== 'undefined') {
+        rb += kissSanitize(marked.parse(sum));
+        usePre = false;
+      } else {
+        rb += esc(sum);
+      }
+      rawBody += sum;
+    } else {
+      const txt = (ev.text || '(no result)').replace(/\n{3,}/g, '\n\n').trim();
+      rb += esc(txt);
+      rawBody += txt;
+    }
+    rc.dataset.rawText = rawBody;
+    rc.innerHTML =
+      '<div class="rc-h"><h3>' +
+      esc(titleOverride || 'Result') +
+      '</h3><div class="rs">' +
+      '<span>Tokens <b>' +
+      fmtN(ev.total_tokens || 0) +
+      '</b></span>' +
+      '<span>Cost <b>' +
+      esc(ev.cost || 'N/A') +
+      '</b></span>' +
+      '</div></div><div class="rc-body md-body' +
+      (usePre ? ' pre' : '') +
+      '">' +
+      rb +
+      '</div>';
+    hlBlock(rc);
+    addCopyButton(rc);
+    const rcBody = rc.querySelector('.rc-body');
+    if (rcBody) linkifyFilePaths(rcBody);
+    return rc;
   }
 
   window.toggleThink = toggleThink;
@@ -1793,6 +2466,12 @@
           } else if (tState.txtNode && tState.txtPending) {
             tState.txtNode.appendData(tState.txtPending);
           }
+          // Surface clickable filepaths inside the streamed text
+          // body so the global click handler can route them to the
+          // extension's ``openFile`` viewer.  Runs regardless of
+          // whether ``marked`` is available — when it is not, the
+          // text node fallback still needs the linkifier.
+          linkifyFilePaths(tState.txtEl);
           tState.txtEl = null;
           tState.txtBuf = '';
           tState.txtNode = null;
@@ -1803,12 +2482,23 @@
         if (tState.bashPanel && tState.bashBuf) {
           tState.bashPanel.textContent += tState.bashBuf;
           tState.bashBuf = '';
+          linkifyFilePaths(tState.bashPanel);
         }
         tState.bashPanel = null;
         tState.bashRaf = 0;
         const c = mkEl('div', 'ev tc');
         const hdr = mkEl('div', 'tc-h');
         hdr.textContent = ev.name || 'Tool';
+        // The Bash tool-call panel header is painted in the cyan
+        // theme colour to visually distinguish shell invocations from
+        // every other tool (which use the orange accent).  Tag the
+        // header (and outer container) with a Bash-specific CSS hook
+        // so ``main.css`` can target it without touching the generic
+        // ``.tc-h`` rule that every other tool depends on.
+        if (ev.name === 'Bash') {
+          hdr.classList.add('tc-h-bash');
+          c.classList.add('tc-bash');
+        }
         let b = '';
         if (ev.path) {
           const ep = esc(ev.path).replace(/"/g, '&quot;');
@@ -1863,6 +2553,7 @@
         addCollapse(c, hdr);
         target.appendChild(c);
         tState.lastToolCallEl = c;
+        stampPanelStart(c);
         if (ev.command) {
           const bp = mkEl('div', 'bash-panel');
           const bpContent = mkEl('div', 'bash-panel-content');
@@ -1878,10 +2569,21 @@
         if (tState.bashPanel && tState.bashBuf) {
           tState.bashPanel.textContent += tState.bashBuf;
           tState.bashBuf = '';
+          linkifyFilePaths(tState.bashPanel);
+        } else if (tState.bashPanel) {
+          // Even if no pending buffer, the panel may have been
+          // populated by prior system_output flushes — make sure
+          // those text nodes are linkified before the bash panel is
+          // finalised.
+          linkifyFilePaths(tState.bashPanel);
         }
         const hadBash = !!tState.bashPanel;
         tState.bashPanel = null;
         tState.bashRaf = 0;
+        // Close out the tool-call panel's time footer here — BEFORE the
+        // ``hadBash && !is_error`` early exit — so every tool_result
+        // path (bash, plain output, error) stamps the elapsed time.
+        if (tState.lastToolCallEl) finalizePanelTime(tState.lastToolCallEl);
         if (hadBash && !ev.is_error) break;
         const resultTarget = tState.lastToolCallEl || target;
         if (ev.is_error) {
@@ -1894,10 +2596,13 @@
           r.dataset.rawText = 'FAILED\n' + (ev.content || '');
           addCollapse(r, r.querySelector('.rl'));
           resultTarget.appendChild(r);
+          const trBody = r.querySelector('.tr-content');
+          if (trBody) linkifyFilePaths(trBody);
         } else {
           const op = mkEl('div', 'bash-panel');
           const opContent = mkEl('div', 'bash-panel-content');
           opContent.textContent = ev.content;
+          linkifyFilePaths(opContent);
           op.appendChild(opContent);
           addCopyButton(op);
           resultTarget.appendChild(op);
@@ -1910,8 +2615,10 @@
           tState.bashBuf += ev.text || '';
           if (!tState.bashRaf) {
             tState.bashRaf = requestAnimationFrame(() => {
-              if (tState.bashPanel)
+              if (tState.bashPanel) {
                 tState.bashPanel.textContent += tState.bashBuf;
+                linkifyFilePaths(tState.bashPanel);
+              }
               tState.bashBuf = '';
               tState.bashRaf = 0;
               if (tState.bashPanel)
@@ -1921,60 +2628,29 @@
         } else {
           const s = mkEl('div', 'ev sys');
           s.textContent = (ev.text || '').replace(/\n\n+/g, '\n');
+          linkifyFilePaths(s);
           target.appendChild(s);
         }
         break;
       }
       case 'result': {
-        const rc = mkEl('div', 'ev rc');
-        let rb = '';
-        let rawBody = '';
-        if (ev.is_continue) {
-          rb +=
-            '<div style="color:var(--yellow);font-weight:700;font-size:var(--fs-xl);margin-bottom:10px">Status: Continue</div>';
-          rawBody += 'Status: Continue\n\n';
-        } else if (ev.success === false) {
-          rb +=
-            '<div style="color:var(--red);font-weight:700;font-size:var(--fs-xl);margin-bottom:10px">Status: FAILED</div>';
-          rawBody += 'Status: FAILED\n\n';
-        }
-        let usePre = true;
-        if (ev.summary) {
-          const sum = (ev.summary || '').replace(/\n{3,}/g, '\n\n').trim();
-          if (typeof marked !== 'undefined') {
-            rb += kissSanitize(marked.parse(sum));
-            usePre = false;
-          } else {
-            rb += esc(sum);
-          }
-          rawBody += sum;
+        const multiSummary = splitMultiSessionSummary(ev.summary);
+        if (multiSummary) {
+          removeResultPanels(target);
+          target.appendChild(
+            createResultPanel(
+              ev,
+              multiSummary.previous,
+              'Previous Sessions',
+              false,
+            ),
+          );
+          target.appendChild(
+            createResultPanel(ev, multiSummary.final, 'Result', true),
+          );
         } else {
-          const txt = (ev.text || '(no result)')
-            .replace(/\n{3,}/g, '\n\n')
-            .trim();
-          rb += esc(txt);
-          rawBody += txt;
+          target.appendChild(createResultPanel(ev, undefined, 'Result', true));
         }
-        // Preserve raw markdown/text result so the panel Copy button
-        // reproduces the agent-supplied markdown rather than the rendered
-        // HTML's textContent (which strips #/`*/` markers).
-        rc.dataset.rawText = rawBody;
-        rc.innerHTML =
-          '<div class="rc-h"><h3>Result</h3><div class="rs">' +
-          '<span>Tokens <b>' +
-          fmtN(ev.total_tokens || 0) +
-          '</b></span>' +
-          '<span>Cost <b>' +
-          esc(ev.cost || 'N/A') +
-          '</b></span>' +
-          '</div></div><div class="rc-body md-body' +
-          (usePre ? ' pre' : '') +
-          '">' +
-          rb +
-          '</div>';
-        hlBlock(rc);
-        addCopyButton(rc);
-        target.appendChild(rc);
         if (statusTokens && ev.total_tokens)
           statusTokens.textContent = 'Tokens: ' + fmtN(ev.total_tokens);
         if (statusBudget && ev.cost && ev.cost !== 'N/A')
@@ -2009,7 +2685,10 @@
         hlBlock(el);
         target.appendChild(el);
         const bodyEl = el.querySelector('.' + cls + '-body');
-        if (bodyEl) bodyEl.scrollTop = bodyEl.scrollHeight;
+        if (bodyEl) {
+          linkifyFilePaths(bodyEl);
+          bodyEl.scrollTop = bodyEl.scrollHeight;
+        }
         break;
       }
       case 'usage_info': {
@@ -2058,6 +2737,10 @@
     const t = ev.type;
     if (t === 'tool_call') {
       lastToolName = ev.name || '';
+      // Close out the previous Thoughts panel — the next streaming
+      // step will create a new one — so the time-spent footer covers
+      // the period between this panel and the tool call that ends it.
+      if (llmPanel) finalizePanelTime(llmPanel);
       llmPanel = null;
       llmPanelState = mkS();
       // Set true (not false) so that non-core tools (screenshot,
@@ -2103,6 +2786,9 @@
       currentTaskMetrics.steps = statusSteps ? statusSteps.textContent : '';
     }
     if (t === 'result') {
+      // Close out the last live Thoughts panel so its bottom-anchored
+      // time footer reflects the duration up to the result event.
+      if (llmPanel) finalizePanelTime(llmPanel);
       collapseAllExceptResult(O);
       if (ev.success === false && !ev.is_continue) {
         const rTab = getTab(activeTabId);
@@ -2151,6 +2837,9 @@
     // Advance the streaming state machine
     if (t === 'tool_call') {
       bgLastToolName = ev.name || '';
+      // Mirror processOutputEvent: close out the previous Thoughts
+      // panel so its time-spent footer covers up to this tool call.
+      if (bgLlmPanel) finalizePanelTime(bgLlmPanel);
       bgLlmPanel = null;
       bgLlmPanelState = mkS();
       bgPendingPanel = true;
@@ -2211,6 +2900,9 @@
       if (statusSteps) statusSteps.textContent = prevStepsText;
 
       if (t === 'result') {
+        // Close out the last bg-tab Thoughts panel so its footer
+        // reflects the duration up to this result event.
+        if (bgLlmPanel) finalizePanelTime(bgLlmPanel);
         if (ev.step_count) {
           bgStepCount = ev.step_count;
           tab.statusStepsText = 'Steps: ' + ev.step_count;
@@ -2556,10 +3248,38 @@
     }
   }
 
+  /**
+   * Toggle the "KISS Sorcar Server is starting ..." overlay.
+   *
+   * When the kiss-web daemon socket is NOT yet connected the overlay
+   * covers the whole webview and #app is hidden so the user does not
+   * see a non-functional tab bar / welcome page.  When connected the
+   * overlay is removed and #app becomes visible.
+   *
+   * Driven by the ``daemonStatus`` message posted from the extension
+   * host (see SorcarSidebarView.ts ``connect``/``disconnect`` handlers
+   * and the ``ready`` handler).
+   */
+  function setServerLoading(loading) {
+    const overlay = document.getElementById('kiss-server-loading');
+    const app = document.getElementById('app');
+    if (overlay) overlay.style.display = loading ? '' : 'none';
+    if (app) app.style.display = loading ? 'none' : '';
+  }
+
   // --- Main event handler ---
   function handleEvent(ev) {
     const t = ev.type;
     switch (t) {
+      case 'daemonStatus':
+        // The extension host has told us whether the kiss-web daemon
+        // socket is connected.  Hide #app and show the loading overlay
+        // until ``connected === true``, then reveal the regular tabs.
+        setServerLoading(!ev.connected);
+        return;
+      case 'notification':
+        updateNotification(ev);
+        break;
       case 'status': {
         const evTab = findTabByEvt(ev);
         if (evTab) {
@@ -2626,8 +3346,22 @@
       case 'models':
         allModels = ev.models || [];
         if (ev.selected) {
+          // Race-fix: propagate the new default into every tab whose
+          // ``selectedModel`` still mirrors the prior default (or is
+          // empty / ``"No model"`` from the launch IIFE).  Tabs where
+          // the user explicitly picked a different model are
+          // preserved.  Without this, ``restoreTab`` reverts the
+          // picker to the stale launch-time value as soon as the user
+          // switches tabs.
+          const _prevSelected = selectedModel;
           selectedModel = ev.selected;
           modelName.textContent = ev.selected;
+          tabs.forEach(t => {
+            const cur = t.selectedModel || '';
+            if (cur === '' || cur === 'No model' || cur === _prevSelected) {
+              t.selectedModel = ev.selected;
+            }
+          });
         }
         renderModelList('');
         break;
@@ -2665,7 +3399,17 @@
         const askTab = getTab(askTabId);
         if (!askTab) break;
         askTab.askPendingQuestion = ev.question || '';
+        if (askTab.id !== activeTabId) {
+          switchToTab(askTab.id);
+        }
         showAskForTab(askTab);
+        break;
+      }
+      case 'askUserDone': {
+        const askTabId = ev.tabId !== undefined ? ev.tabId : activeTabId;
+        const askTab = getTab(askTabId);
+        if (!askTab) break;
+        clearAskForMatchingChatTabs(askTab);
         break;
       }
       case 'error':
@@ -2705,6 +3449,17 @@
         }
         if (ev.chat_id && clearTab) {
           clearTab.backendChatId = ev.chat_id;
+          // Pin the tab's ``workDir`` the moment a chat-id of a real
+          // persisted task is bound to it.  Once bound, a later
+          // settings-panel change to ``configWorkDir`` MUST NOT shift
+          // this tab's effective work_dir (INVARIANTS.md → Tabs &
+          // chat webview).  ``workDirForTab`` would otherwise fall
+          // back to the daemon-global ``configWorkDir`` and route
+          // follow-up commands (submit, autocommitAction, …) to the
+          // wrong repo.
+          if (!clearTab.workDir && configWorkDir) {
+            clearTab.workDir = configWorkDir;
+          }
           persistTabState();
         }
         const evTabId = ev.tabId;
@@ -2857,6 +3612,18 @@
         const teTab = getTab(teTabId);
         if (ev.chat_id && teTab) {
           teTab.backendChatId = ev.chat_id;
+          // Pin the tab's ``workDir`` when a chat-id of a real
+          // persisted task is bound (INVARIANTS.md → Tabs & chat
+          // webview).  ``extra.work_dir`` (parsed further down) takes
+          // priority and may overwrite this value with the task's
+          // recorded directory; this fallback only kicks in for
+          // replays whose ``extra`` is missing ``work_dir`` (older
+          // rows), keeping the tab pinned to whatever ``configWorkDir``
+          // was at bind time instead of leaking later settings-panel
+          // changes through ``workDirForTab``'s fallback.
+          if (!teTab.workDir && configWorkDir) {
+            teTab.workDir = configWorkDir;
+          }
           persistTabState();
         }
         // Track the task_id of the currently displayed task so a later
@@ -3107,7 +3874,8 @@
             anthropic_api_key: 'ANTHROPIC_API_KEY',
             together_api_key: 'TOGETHER_API_KEY',
             openrouter_api_key: 'OPENROUTER_API_KEY',
-            minimax_api_key: 'MINIMAX_API_KEY',
+            zai_api_key: 'ZAI_API_KEY',
+            moonshot_api_key: 'MOONSHOT_API_KEY',
           };
           const envVar = envMap[sKey];
           if (envVar) {
@@ -3229,7 +3997,7 @@
           const after = inp.value.substring(pos);
           const insert = ev.paths
             .map(p => {
-              return 'PWD/' + p;
+              return './' + p;
             })
             .join(' ');
           const needSpace = before.length > 0 && !/\s$/.test(before);
@@ -3321,6 +4089,7 @@
           ev.startTs,
           ev.endTs,
         );
+        focusFinishedTab(ev.tabId);
         break;
       }
       case 'task_error':
@@ -3338,16 +4107,17 @@
               ? 'Interrupted'
               : 'Stopped';
         setReady(label, ev.tabId, ev.startTs, ev.endTs);
+        focusFinishedTab(ev.tabId);
         break;
       }
       case 'new_tab': {
         // Backend → frontend request to open a fresh chat tab and
         // resume an existing task into it.  ``task_id`` is the
         // backend's identity for the task; the frontend allocates a
-        // tab id via ``createNewTab`` (frontend-only concept) and
-        // then posts ``resumeSession`` back to the backend.  The
-        // server's ``_cmd_resume_session`` handler supports a
-        // task-id-only resume (no ``chatId`` required).
+        // tab id (frontend-only concept) and then posts
+        // ``resumeSession`` back to the backend.  The server's
+        // ``_cmd_resume_session`` handler supports a task-id-only
+        // resume (no ``chatId`` required).
         //
         // Sub-agent ``new_tab`` events carry ``parent_tab_id``.  The
         // backend broadcasts them to ALL connected webviews (no
@@ -3358,25 +4128,34 @@
         if (ev.parent_tab_id && !tabs.find(t => t.id === ev.parent_tab_id))
           break;
         if (ev.task_id === undefined || ev.task_id === null) break;
-        // Remember the parent tab id BEFORE createNewTab changes
-        // activeTabId, so we can switch back after wiring the
-        // sub-agent tab.
         const parentTabBeforeNew = ev.parent_tab_id || '';
-        createNewTab();
-        // Capture the sub-agent tab id before switching back.
-        const subAgentTabId = activeTabId;
+        let subAgentTabId;
+        if (parentTabBeforeNew) {
+          // Sub-agent path: build the new tab in the BACKGROUND so the
+          // user's foreground tab is never disturbed.  Calling
+          // ``createNewTab`` here would (1) flip ``activeTabId`` to
+          // the new tab, painting its empty welcome screen for one
+          // frame before a follow-up ``switchToTab`` reverted it,
+          // (2) post a spurious ``newChat`` for what is really the
+          // parent's chat session, (3) post ``getWelcomeSuggestions``
+          // for a tab that will never show a welcome screen, and (4)
+          // steal keyboard focus from the parent the user is typing
+          // in.  ``createBackgroundSubagentTab`` does none of that.
+          const subTab = createBackgroundSubagentTab(parentTabBeforeNew);
+          subAgentTabId = subTab.id;
+        } else {
+          // Defensive path: a ``new_tab`` event with no
+          // ``parent_tab_id`` is not produced by any current backend
+          // emitter, but if a future code path emits one we keep the
+          // legacy "create + activate" behaviour for it.
+          createNewTab();
+          subAgentTabId = activeTabId;
+        }
         vscode.postMessage({
           type: 'resumeSession',
           taskId: ev.task_id,
           tabId: subAgentTabId,
         });
-        // Switch back to the parent (non-sub-agent) tab so the
-        // user stays focused on the main task.  Sub-agent tabs
-        // are still accessible via the tab bar if the user wants
-        // to inspect them.
-        if (parentTabBeforeNew) {
-          switchToTab(parentTabBeforeNew);
-        }
         break;
       }
       case 'openSubagentTab': {
@@ -3598,6 +4377,23 @@
     updateInputDisabled();
     if (running) {
       startTimer();
+      // Show the wait-spinner whenever the UI flips to running.
+      // Without this, the spinner is only (re)started inside
+      // ``processOutputEvent`` when an event arrives on the active
+      // tab.  During ``run_parallel`` the parent agent emits one
+      // ``tool_call`` event and then blocks while sub-agents run —
+      // meanwhile each sub-agent's ``new_tab`` broadcast causes the
+      // frontend to ``createNewTab`` (which calls
+      // ``setRunningState(false)`` + ``removeSpinner`` on the new
+      // sub-tab) and ``switchToTab`` back to the still-running parent
+      // (calling ``setRunningState(true)`` here).  Without
+      // ``showSpinner`` in this branch the parent tab is left with a
+      // cancelled timer and no visible spinner for the entire
+      // duration of the parallel fan-out.  Calling ``showSpinner``
+      // here makes the spinner consistent across (a) task start
+      // (``status running:true``), (b) tab switch back to a running
+      // tab, and (c) ``run_parallel`` sub-agent spawn/switch-back.
+      showSpinner();
     } else {
       // Safety net: ensure the timer always stops when the running
       // state flips to false.  Without this, if a ``status: running:
@@ -3623,6 +4419,33 @@
       tab.hasRunTask = true;
       tab.lastTaskFailed = !!failed;
     }
+  }
+
+  /**
+   * Auto-switch the active tab to ``tabId`` after the task running in
+   * that tab has just ended (task_done / task_error / task_stopped /
+   * task_interrupted).  Without this the user, who may have moved to
+   * a different chat tab while waiting for the background task to
+   * finish, would have to manually click back to see the result; the
+   * product contract is that the webview MUST switch to the tab
+   * whose task just completed so the result panel is immediately
+   * visible.
+   *
+   * Silently a no-op when:
+   *
+   *   * ``tabId`` is missing (legacy/global events without a
+   *     per-tab identity — there is no specific tab to focus),
+   *   * the tab is not present in this webview's ``tabs`` array
+   *     (events are broadcast to every connected client; a webview
+   *     that does not own the tab must ignore the focus request),
+   *   * the tab is already the active tab (no-op; ``switchToTab``
+   *     also short-circuits, but we filter here for clarity).
+   */
+  function focusFinishedTab(tabId) {
+    if (tabId === undefined || tabId === null) return;
+    if (tabId === activeTabId) return;
+    if (!getTab(tabId)) return;
+    switchToTab(tabId);
   }
 
   function setReady(label, tabId, doneStartTs, doneEndTs) {
@@ -3776,7 +4599,31 @@
    * @param {string} latest - The latest version reported by PyPI.
    * @param {string} current - The version installed locally.
    */
+  // Stable id for the permanent "update available" notification.  Using
+  // a fixed string (instead of the auto-generated ``Date.now()``)
+  // ensures the hourly PyPI re-broadcast re-uses the existing toast
+  // rather than stacking duplicate notifications on top of each other.
+  const UPDATE_NOTIFICATION_ID = 'kiss-update-available';
+
+  // Inline SVG markup for the Feather "download" arrow used by both the
+  // small settings-button badge and the action-button icon inside the
+  // permanent update notification.  Kept as a single source of truth so
+  // the two surfaces always look identical.
+  const UPDATE_DOWNLOAD_SVG =
+    '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" ' +
+    'viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>' +
+    '<polyline points="7 10 12 15 17 10"/>' +
+    '<line x1="12" y1="15" x2="12" y2="3"/>' +
+    '</svg>';
+
   function renderUpdateAvailable(available, latest, current) {
+    renderUpdateAvailableBadge(available, latest, current);
+    renderUpdateAvailableNotification(available, latest, current);
+  }
+
+  function renderUpdateAvailableBadge(available, latest, current) {
     const btn = document.getElementById('cfg-update-btn');
     if (!btn) return;
     // Strip any previously-injected icon so repeated broadcasts do
@@ -3822,6 +4669,48 @@
       icon.appendChild(el);
     }
     btn.insertBefore(icon, btn.firstChild);
+  }
+
+  /**
+   * Show (or dismiss) the permanent "KISS Sorcar update available"
+   * notification.
+   *
+   * The settings-panel "Update" button is only visible while the
+   * settings panel is expanded, which left users who never opened
+   * the panel unaware that a new release was waiting.  This helper
+   * surfaces the same event in the always-visible chat-webview
+   * notification stack with an SVG-iconed action button.  The
+   * notification is sticky (never auto-dismisses) so it stays put
+   * until the user clicks the update button or the next PyPI poll
+   * reports the user is current.
+   */
+  function renderUpdateAvailableNotification(available, latest, current) {
+    if (!available) {
+      removeNotification(UPDATE_NOTIFICATION_ID, undefined, false);
+      return;
+    }
+    const message =
+      latest && current
+        ? `KISS Sorcar ${latest} is available (you have ${current}).`
+        : 'A new KISS Sorcar release is available.';
+    showNotification({
+      id: UPDATE_NOTIFICATION_ID,
+      severity: 'info',
+      message,
+      sticky: true,
+      actions: [
+        {
+          label: 'Update',
+          ariaLabel: latest
+            ? `Update KISS Sorcar to ${latest}`
+            : 'Update KISS Sorcar',
+          svg: UPDATE_DOWNLOAD_SVG,
+          onClick: () => {
+            vscode.postMessage({type: 'runUpdate'});
+          },
+        },
+      ],
+    });
   }
 
   // --- Welcome suggestions (dynamic) ---
@@ -4560,7 +5449,8 @@
       'cfg-key-ANTHROPIC_API_KEY',
       'cfg-key-TOGETHER_API_KEY',
       'cfg-key-OPENROUTER_API_KEY',
-      'cfg-key-MINIMAX_API_KEY',
+      'cfg-key-ZAI_API_KEY',
+      'cfg-key-MOONSHOT_API_KEY',
       'cfg-custom-api-key',
     ].forEach(setupSecretInput);
     // The welcome-page remote-password input and the settings-panel
@@ -4630,11 +5520,89 @@
       });
     }
 
+    // Open/close helpers for the in-settings-panel floating confirmation
+    // box.  The dialog replaces the native VS Code modal warning so the
+    // confirmation lives WITHIN the settings panel itself.  Only OK
+    // forwards ``{type:'serverReset'}`` to the extension; Cancel, the
+    // backdrop, and Escape all simply close the box.
+    function openServerResetConfirm() {
+      if (!serverResetConfirmModal) return;
+      serverResetConfirmModal.classList.add('open');
+      // Focus the OK button so keyboard users can confirm with Enter
+      // (or dismiss with Escape) without reaching for the mouse.
+      if (serverResetConfirmOkBtn) {
+        try {
+          serverResetConfirmOkBtn.focus();
+        } catch (_err) {
+          // ``focus()`` can throw if the element is detached or in a
+          // hidden subtree (some JSDOM versions); the dialog still
+          // works without focus, so swallow.
+        }
+      }
+    }
+    function closeServerResetConfirm() {
+      if (!serverResetConfirmModal) return;
+      serverResetConfirmModal.classList.remove('open');
+    }
+    function isServerResetConfirmOpen() {
+      return !!(
+        serverResetConfirmModal &&
+        serverResetConfirmModal.classList.contains('open')
+      );
+    }
+
     if (serverResetBtn) {
       serverResetBtn.addEventListener('click', e => {
         e.preventDefault();
         e.stopPropagation();
+        // Server reset SIGTERMs the kiss-web daemon, killing every
+        // in-flight agent.  When any tab still has a running agent we
+        // surface an in-webview floating confirmation box anchored to
+        // the settings panel; only OK forwards the reset.  When no
+        // agent is running we fast-path the reset.
+        //
+        // Guard: if the confirmation box is already open, ignore the
+        // click — otherwise rapid double-clicks would re-open / stack
+        // the dialog.
+        if (isServerResetConfirmOpen()) return;
+        const agentRunning = tabs.some(tab => tab && tab.isRunning);
+        if (!agentRunning) {
+          vscode.postMessage({type: 'serverReset'});
+          return;
+        }
+        openServerResetConfirm();
+      });
+    }
+
+    if (serverResetConfirmOkBtn) {
+      serverResetConfirmOkBtn.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        closeServerResetConfirm();
         vscode.postMessage({type: 'serverReset'});
+      });
+    }
+    if (serverResetConfirmCancelBtn) {
+      serverResetConfirmCancelBtn.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        closeServerResetConfirm();
+      });
+    }
+    if (serverResetConfirmModal) {
+      // Clicking the dimmed backdrop (the modal element itself, not its
+      // inner content box) dismisses the dialog without confirming.
+      serverResetConfirmModal.addEventListener('click', e => {
+        if (e.target === serverResetConfirmModal) closeServerResetConfirm();
+      });
+      // Escape closes the dialog — only when it's open, so we don't
+      // swallow Escape for the rest of the webview.
+      document.addEventListener('keydown', e => {
+        if (e.key === 'Escape' && isServerResetConfirmOpen()) {
+          e.preventDefault();
+          e.stopPropagation();
+          closeServerResetConfirm();
+        }
       });
     }
 
@@ -5108,13 +6076,32 @@
     if (tab.id === activeTabId) mountAskForTab(tab);
   }
 
+  /** Return true when an ask-clear for sourceTab should also clear candidate. */
+  function isAskSameChatTab(sourceTab, candidate) {
+    if (!sourceTab || !candidate) return false;
+    if (candidate.id === sourceTab.id) return true;
+    const chatId = String(sourceTab.backendChatId || '');
+    return !!chatId && String(candidate.backendChatId || '') === chatId;
+  }
+
+  /** Clear pending ask-user UI for sourceTab and sibling tabs on the same chat. */
+  function clearAskForMatchingChatTabs(sourceTab) {
+    let shouldClearSlot = false;
+    for (let i = 0; i < tabs.length; i++) {
+      const tab = tabs[i];
+      if (!isAskSameChatTab(sourceTab, tab)) continue;
+      tab.askPendingQuestion = null;
+      if (tab.askInputEl) tab.askInputEl.value = '';
+      if (tab.id === activeTabId) shouldClearSlot = true;
+    }
+    if (shouldClearSlot) clearAskSlot();
+  }
+
   /** Submit the current answer for the given tab; clear pending question. */
   function submitAskForTab(tab) {
     const answer = tab.askInputEl ? tab.askInputEl.value : '';
     vscode.postMessage({type: 'userAnswer', answer: answer, tabId: tab.id});
-    tab.askPendingQuestion = null;
-    if (tab.askInputEl) tab.askInputEl.value = '';
-    if (tab.id === activeTabId) clearAskSlot();
+    clearAskForMatchingChatTabs(tab);
   }
 
   /**
@@ -5312,6 +6299,25 @@
     }
     allHistSessions = allHistSessions.concat(sessions);
 
+    // Compute the live running→completed transitions BEFORE
+    // rendering: any task_id that was rendered as running on the
+    // previous ``renderHistory`` call but is no longer running on
+    // this call has just completed in the user's current session,
+    // so its row must show the SOLID green dot from now on (and
+    // STAY that way for the rest of the page session).  We compute
+    // the new running set from the full ``allHistSessions`` (not
+    // just this batch) so pagination batches don't artificially
+    // drop ids that are simply absent from the current chunk.
+    const newRunningTaskIds = new Set();
+    allHistSessions.forEach(s => {
+      if (s.is_running && s.task_id) newRunningTaskIds.add(s.task_id);
+    });
+    historyLastRunningTaskIds.forEach(id => {
+      if (!newRunningTaskIds.has(id)) historyJustCompletedTaskIds.add(id);
+    });
+    historyLastRunningTaskIds.clear();
+    newRunningTaskIds.forEach(id => historyLastRunningTaskIds.add(id));
+
     sessions.forEach(s => {
       const div = document.createElement('div');
       // Match the Running tab's visual layout: the ``running-item``
@@ -5353,6 +6359,21 @@
         failedDot.dataset.tooltip = 'Task failed';
         failedDot.setAttribute('aria-label', 'Task failed');
         div.appendChild(failedDot);
+      } else if (s.task_id && historyJustCompletedTaskIds.has(s.task_id)) {
+        // The row was rendered as ``is_running:true`` earlier in
+        // this page session and has now transitioned to
+        // finished-cleanly.  Render the SOLID green circle (no
+        // animation) and KEEP it for the rest of the session — even
+        // after subsequent ``refreshHistory()`` reloads.  Tasks
+        // that the user never saw running in this session (e.g.
+        // every row on a fresh page-load) intentionally render NO
+        // dot, so the History panel doesn't show a sea of solid
+        // green circles for old completed tasks.
+        const completedDot = document.createElement('span');
+        completedDot.className = 'sidebar-item-completed';
+        completedDot.dataset.tooltip = 'Task completed';
+        completedDot.setAttribute('aria-label', 'Task completed');
+        div.appendChild(completedDot);
       }
 
       const textSpan = document.createElement('span');
@@ -5466,10 +6487,24 @@
         div.appendChild(actions);
       }
 
+      // Per-row info column — wraps the three stacked detail lines
+      // (metrics, workspace+meta, chat/task/parent ids) so they
+      // render flush, with no flex row-gap between them.  The
+      // container itself uses ``flex-basis: 100%`` to drop onto its
+      // own line below the running/failed dot, the task text, and
+      // the action column (mirroring the trick the metrics span used
+      // when it was a direct sibling).  Its inner ``flex-direction:
+      // column`` + ``gap: 0`` rule stacks the three lines tightly.
+      const info = document.createElement('div');
+      info.className = 'running-item-info';
+
       // Metrics row (steps • tokens • cost • duration) — matches the
-      // Running tab.  ``flex-basis: 100%`` on .running-item-metrics
-      // drops this onto its own line below the running/failed dot,
-      // the task text, and the delete button.
+      // Running tab.  Rendered as the first child of the info
+      // container above; ``.running-item-metrics`` no longer needs
+      // ``flex-basis: 100%`` (the container handles the line break)
+      // but the rule is kept for backwards compatibility with any
+      // other surface that may still render it as a direct child of
+      // ``.sidebar-item``.
       const metrics = document.createElement('span');
       metrics.className = 'running-item-metrics';
       const tokens = Number(s.tokens || 0);
@@ -5517,16 +6552,13 @@
         cost.toFixed(4) +
         dur +
         when;
-      div.appendChild(metrics);
+      info.appendChild(metrics);
 
       // Workspace + meta row — the task's ``work_dir`` and the
       // persisted run metadata (model name, wt/no-wt,
       // parallel/sequential, auto-commit/manual-commit) rendered
       // as a single dot-separated line IMMEDIATELY after the
-      // metrics line.  ``flex-basis: 100%`` on
-      // ``.running-item-workspace`` drops it onto its own line
-      // below the metrics row inside the ``.sidebar-item`` flex
-      // container.  Format:
+      // metrics line inside the per-row info column.  Format:
       //
       //   <work_dir> • <model> • <wt|no-wt>
       //     • <parallel|sequential> • <auto-commit|manual-commit>
@@ -5562,8 +6594,51 @@
         // long enough to be clipped by overflow:hidden in the
         // sidebar.
         workspace.title = text;
-        div.appendChild(workspace);
+        info.appendChild(workspace);
       }
+
+      // Ids row — chat id, task id, and parent task id rendered as
+      // a single dot-separated line right below the workspace+meta
+      // line.  Format:
+      //
+      //   chat <chat_id> • task <task_id> • parent <parent_task_id>
+      //
+      // Each field is omitted when not present so legacy rows that
+      // pre-date a particular id, plus regular (non-sub-agent) rows
+      // that have no ``parent_task_id``, render cleanly without
+      // dangling bullets or placeholder text.  When NONE of the
+      // three ids is set we skip the span entirely so the History
+      // panel does not show an empty third line.
+      const chatId = typeof s.id === 'string' ? s.id : '';
+      const taskIdRaw = s.task_id;
+      const taskIdStr =
+        taskIdRaw === undefined || taskIdRaw === null ? '' : String(taskIdRaw);
+      const parentIdRaw = s.parent_task_id;
+      const parentIdStr =
+        parentIdRaw === undefined || parentIdRaw === null
+          ? ''
+          : String(parentIdRaw);
+      const idParts = [];
+      if (chatId) idParts.push('chat ' + chatId);
+      if (taskIdStr) idParts.push('task ' + taskIdStr);
+      if (parentIdStr) idParts.push('parent ' + parentIdStr);
+      if (idParts.length > 0) {
+        const idsSpan = document.createElement('span');
+        idsSpan.className = 'running-item-ids';
+        const idsText = idParts.join(' • ');
+        idsSpan.textContent = idsText;
+        // Native HTML tooltip — useful when the combined line is
+        // long enough to be clipped by overflow:hidden in the
+        // sidebar.
+        idsSpan.title = idsText;
+        info.appendChild(idsSpan);
+      }
+
+      // Finally attach the per-row info column to the row itself.
+      // Appended LAST so the running/failed dot, the task text, and
+      // the action buttons sit on the row's first visual line and
+      // the info container drops onto the second visual line.
+      div.appendChild(info);
 
       div.addEventListener('click', () => {
         if (demoMode && typeof window._startDemoReplay === 'function') {
@@ -5572,21 +6647,30 @@
           window._startDemoReplay(allHistSessions);
           return;
         }
-        // Sub-agent history rows reopen as a regular chat tab that
-        // the backend (``_replay_session``) will then flip into a
-        // sub-agent tab via ``openSubagentTab`` (purple accent,
-        // no input bar, no adjacent-task loading).  We do
-        // not look up "is the original sub-agent tab still open?" —
-        // sub-agent rows are persisted with just their parent
-        // task_history.id, so the simplest UX is a fresh tab whose
-        // events are replayed from the row's own events table.
-        // When the clicked history row has a known chat_id (s.id)
-        // and persisted events, allocate a fresh tab id and let the
-        // backend route the chat lookup by chat_id (passed in the
-        // ``resumeSession`` payload).  ``tab_id`` and ``chat_id``
-        // are orthogonal — the same chat may be live-viewed from
-        // multiple tabs, each with its own routing key.
-        if (s.has_events && s.id) {
+        // A client must never display the same backend chat id in two
+        // local tabs.  If this history row's chat is already open (for
+        // example the user is on a blank tab and clicks an older row
+        // for a chat that is open to the left), simply switch focus to
+        // that tab instead of creating a duplicate tab and issuing a
+        // second resumeSession for the same chat.
+        const existingChatTab = getTabByBackendChatId(s.id);
+        if (existingChatTab) {
+          switchToTab(existingChatTab.id);
+        } else if (s.has_events && s.id) {
+          // Sub-agent history rows reopen as a regular chat tab that
+          // the backend (``_replay_session``) will then flip into a
+          // sub-agent tab via ``openSubagentTab`` (purple accent,
+          // no input bar, no adjacent-task loading).  We do
+          // not look up "is the original sub-agent tab still open?" —
+          // sub-agent rows are persisted with just their parent
+          // task_history.id, so the simplest UX is a fresh tab whose
+          // events are replayed from the row's own events table.
+          // When the clicked history row has a known chat_id (s.id)
+          // and persisted events, allocate a fresh tab id and let the
+          // backend route the chat lookup by chat_id (passed in the
+          // ``resumeSession`` payload).  ``tab_id`` and ``chat_id``
+          // are orthogonal — each local tab has its own routing key,
+          // but there is at most one local tab per backend chat id.
           createNewTab();
           const taskText = s.preview || s.title || '';
           setTaskText(taskText);
@@ -5864,7 +6948,23 @@
       const dateOk = ts >= fromTs && ts <= toTs;
       const favOk = !onlyFavorite || row.dataset.favorite === '1';
       const rowWorkDir = row.dataset.workDir || '';
-      const wsOk = !onlyWorkspace || rowWorkDir === clientWorkDir;
+      // Workspace match honors the documented contract above: an
+      // empty client work_dir or an empty row work_dir BOTH pass so
+      // (a) freshly-started running tasks whose ``extra.work_dir``
+      //     hasn't been persisted yet still appear in History when
+      //     the user opens the burger menu in a real workspace, and
+      // (b) standalone web clients with no folder open ("client
+      //     work_dir empty") see every row.
+      // Without this, the strict ``rowWorkDir === clientWorkDir``
+      // test silently hides every running-task row whose work_dir
+      // hasn't been written yet — exactly the user-reported
+      // "task panel does not show up in History after burger open"
+      // regression.
+      const wsOk =
+        !onlyWorkspace ||
+        rowWorkDir === '' ||
+        clientWorkDir === '' ||
+        rowWorkDir === clientWorkDir;
       if (catOk && dateOk && favOk && wsOk) {
         row.style.display = '';
         visible++;
@@ -6274,7 +7374,8 @@
       'ANTHROPIC_API_KEY',
       'TOGETHER_API_KEY',
       'OPENROUTER_API_KEY',
-      'MINIMAX_API_KEY',
+      'ZAI_API_KEY',
+      'MOONSHOT_API_KEY',
     ];
     keyIds.forEach(k => {
       el('cfg-key-' + k).value = (apiKeys && apiKeys[k]) || '';
@@ -6306,7 +7407,8 @@
       'ANTHROPIC_API_KEY',
       'TOGETHER_API_KEY',
       'OPENROUTER_API_KEY',
-      'MINIMAX_API_KEY',
+      'ZAI_API_KEY',
+      'MOONSHOT_API_KEY',
     ];
     keyIds.forEach(k => {
       const v = el('cfg-key-' + k).value.trim();
@@ -6442,7 +7544,7 @@
       const before = inp.value.substring(0, atCtx.start);
       const after = inp.value.substring(inp.selectionStart || inp.value.length);
       const sep = /^\s/.test(after) ? '' : ' ';
-      const mention = 'PWD/' + file;
+      const mention = './' + file;
       inp.value = before + mention + sep + after;
       syncClearBtn();
       const np = before.length + mention.length + sep.length;

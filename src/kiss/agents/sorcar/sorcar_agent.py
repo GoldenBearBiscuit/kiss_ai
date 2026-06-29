@@ -41,65 +41,6 @@ from kiss.core.relentless_agent import RelentlessAgent
 logger = logging.getLogger(__name__)
 
 
-def _save_setting_to_config(key: str, value: Any) -> None:
-    """Persist a single setting to ~/.kiss/config.json.
-
-    Loads the existing config, updates the specified key, and saves
-    atomically. Also applies the change to the running environment.
-
-    Args:
-        key: The config key (e.g. "max_budget", "work_dir").
-        value: The new value for the key.
-    """
-    try:
-        from kiss.agents.vscode.vscode_config import (
-            apply_config_to_env,
-            load_config,
-            save_config,
-        )
-
-        cfg = load_config()
-        cfg[key] = value
-        save_config(cfg)
-        apply_config_to_env(cfg)
-    except Exception:
-        pass
-
-
-def _apply_setting(
-    updated: list[str],
-    broadcast: Callable[[dict[str, Any]], None] | None,
-    key: str,
-    value: Any,
-    label: str | None = None,
-    broadcast_value: Any = None,
-) -> None:
-    """Record, persist, and broadcast a single settings update.
-
-    Appends a human-readable entry to *updated*, persists *value* under
-    *key* via :func:`_save_setting_to_config`, and broadcasts an
-    ``updateSetting`` event to the frontend when *broadcast* is set.
-
-    Args:
-        updated: Accumulator of "key=value" summary strings.
-        broadcast: Frontend broadcast callable, or ``None``.
-        key: The config / broadcast key.
-        value: The new value to persist.
-        label: Override for the summary entry (default ``"{key}={value}"``);
-            used to mask secrets (e.g. ``"remote_password=<updated>"``).
-        broadcast_value: Override for the broadcast payload value
-            (default *value*); used to avoid leaking secrets to the UI.
-    """
-    updated.append(label if label is not None else f"{key}={value}")
-    _save_setting_to_config(key, value)
-    if broadcast:
-        broadcast({
-            "type": "updateSetting",
-            "key": key,
-            "value": value if broadcast_value is None else broadcast_value,
-        })
-
-
 def _generate_commit_message(
     commit_dir: Path, user_prompt: str | None = None,
 ) -> str:
@@ -129,14 +70,27 @@ def auto_commit_changes(
     commit_dir: Path,
     user_prompt: str | None,
     message_fn: Callable[[Path, str | None], str],
+    notify_fn: Callable[[str, str], None] | None = None,
 ) -> bool:
     """Stage all changes, generate a commit message, and commit.
 
-    Stages all changes once, generates a commit message from the
-    staged diff via *message_fn*, then commits the already-staged
-    changes (without re-staging).  Falls back to a generic commit
-    message when *message_fn* raises (e.g. the LLM-based generator
-    is unavailable).
+    Stages once so *message_fn* can compute the diff, runs
+    *message_fn* (typically a slow LLM call) to generate the commit
+    subject/body, then re-stages immediately before the commit so
+    any file that appeared in the worktree during the LLM call
+    (e.g. ``PROGRESS.md`` rewrites, macOS ``.DS_Store`` materializing
+    after an ``open`` of the report, an editor side-channel saving
+    swap files) is included in the same commit.  Without the second
+    ``stage_all`` those late-arriving files would be left
+    uncommitted, ``_finalize_worktree`` would see them via
+    ``has_uncommitted_changes`` and abort the auto-merge with the
+    misleading "pre-commit hook may have rejected" warning
+    (observed in production on 2026-06-26 07:23:14 for worktree
+    ``kiss_wt-1782483430-cb03445c`` even though the repo had no
+    custom pre-commit hooks installed).
+
+    Falls back to a generic commit message when *message_fn* raises
+    (e.g. the LLM-based generator is unavailable).
 
     Args:
         commit_dir: Directory whose changes are staged and committed.
@@ -144,6 +98,27 @@ def auto_commit_changes(
             message (or its fallback), or ``None`` when unavailable.
         message_fn: Callable producing a commit message from
             ``(commit_dir, user_prompt)``.
+        notify_fn: Optional UI callback invoked at two life-cycle
+            points so the chat webview can render toasts:
+
+            - ``notify_fn("generating", "")`` immediately before
+              *message_fn* runs (typically a slow LLM call) so the
+              user sees "Generating commit message" while the LLM
+              works.
+            - ``notify_fn("committed", subject)`` immediately after
+              a successful commit, where *subject* is the first
+              non-empty line of the committed message.
+
+            Both hooks are SKIPPED when there is nothing to commit
+            (no staged diff after the initial ``stage_all``), so the
+            webview never sees a misleading "Generating commit
+            message" toast without a follow-up.  The "committed"
+            hook is also not invoked when ``commit_staged`` returns
+            ``False`` after *message_fn* (e.g. pre-commit hook
+            rejected the commit).
+
+            All ``notify_fn`` exceptions are swallowed so a broken
+            UI hook can never block the commit itself.
 
     Returns:
         True if a commit was created, False if nothing to commit.
@@ -151,6 +126,14 @@ def auto_commit_changes(
     from kiss.agents.sorcar.git_worktree import GitWorktreeOps
 
     GitWorktreeOps.stage_all(commit_dir)
+    # Short-circuit cleanly when there is nothing to commit: no
+    # "generating" toast (it would be misleading because no commit
+    # will happen), no LLM call (saves tokens), no follow-up
+    # "committed" toast.  Late-arriving files don't matter here
+    # because there's no slow message_fn window to race against.
+    if not GitWorktreeOps.staged_diff(commit_dir):
+        return False
+    _safe_notify(notify_fn, "generating", "")
     try:
         msg = message_fn(commit_dir, user_prompt)
     except Exception:
@@ -162,7 +145,50 @@ def auto_commit_changes(
             from kiss.agents.vscode.helpers import _append_user_prompt
 
             msg = _append_user_prompt(msg, user_prompt)
-    return GitWorktreeOps.commit_staged(commit_dir, msg)
+    # Re-stage immediately before committing to capture any files
+    # that materialized during the (typically slow) *message_fn*
+    # call — see the docstring above for the production race this
+    # closes.  Cheap when nothing changed (``git add -A`` is a no-op
+    # against an unchanged tree).
+    GitWorktreeOps.stage_all(commit_dir)
+    committed = GitWorktreeOps.commit_staged(commit_dir, msg)
+    if committed:
+        _safe_notify(notify_fn, "committed", _commit_subject(msg))
+    return committed
+
+
+def _commit_subject(message: str) -> str:
+    """Return the first non-empty line of a commit *message*.
+
+    Used as the subject the chat webview renders inside the
+    "Committed <subject>" toast.  Falls back to an empty string when
+    the message has no printable line (defensive: in practice the
+    fallback message always starts with ``kiss:``).
+    """
+    for raw in message.splitlines():
+        line = raw.strip()
+        if line:
+            return line
+    return ""
+
+
+def _safe_notify(
+    notify_fn: Callable[[str, str], None] | None,
+    stage: str,
+    subject: str,
+) -> None:
+    """Invoke *notify_fn* swallowing any exception.
+
+    Errors in the optional UI hook must never prevent the commit
+    itself (and must never poison the surrounding ``except`` block
+    that the LLM-failure fallback relies on).
+    """
+    if notify_fn is None:
+        return
+    try:
+        notify_fn(stage, subject)
+    except Exception:
+        logger.debug("auto_commit_changes notify_fn raised", exc_info=True)
 
 
 def _yaml_failure(exc: BaseException) -> str:
@@ -390,134 +416,6 @@ class SorcarAgent(RelentlessAgent):
             result_str: str = yaml.dump(results, sort_keys=False)
             return result_str
 
-        def update_settings(
-            is_parallel: bool | None = None,
-            is_worktree: bool | None = None,
-            model_name: str | None = None,
-            max_budget: float | None = None,
-            use_web_browser: bool | None = None,
-            remote_password: str | None = None,
-            demo_mode: bool | None = None,
-            auto_commit: bool | None = None,
-            custom_endpoint: str | None = None,
-            custom_headers: str | None = None,
-        ) -> str:
-            """Update task configuration settings during execution.
-
-            Modifies runtime agent settings, persists config-level changes,
-            and broadcasts UI updates to the frontend. Only provided
-            (non-None) keys are updated; omitted keys are left unchanged.
-
-            API keys (e.g. ``custom_api_key``, ``openai_api_key``,
-            ``anthropic_api_key``) cannot be updated through this tool for
-            security reasons.  Users must set them through the settings UI
-            or environment variables.
-
-            Args:
-                is_parallel: Enable/disable parallel sub-agent spawning.
-                is_worktree: Enable/disable git worktree isolation.
-                model_name: Switch the LLM model for subsequent sub-sessions.
-                max_budget: Set the maximum budget in USD.
-                use_web_browser: Enable/disable browser/web tools.
-                remote_password: Set the remote access password.
-                demo_mode: Enable/disable demo replay mode in the UI.
-                auto_commit: When True, trigger auto-commit of pending changes.
-                custom_endpoint: Set a custom LLM endpoint URL (e.g. local model).
-                custom_headers: Set custom HTTP headers (Key:Value, one per line).
-
-            Returns:
-                A summary of which settings were updated.
-            """
-            updated: list[str] = []
-            broadcast = (
-                getattr(self.printer, "broadcast", None)
-                if self.printer
-                else None
-            )
-
-            if is_parallel is not None:
-                self._is_parallel = bool(is_parallel)
-                _apply_setting(updated, broadcast, "is_parallel", self._is_parallel)
-
-            if is_worktree is not None:
-                _apply_setting(updated, broadcast, "is_worktree", bool(is_worktree))
-
-            if model_name is not None:
-                # Special-cased: the model is persisted via the last-model
-                # store (not the config file) and applied to the live agent.
-                self.model_name = model_name
-                updated.append(f"model={model_name}")
-                from kiss.agents.sorcar.persistence import _save_last_model
-                _save_last_model(model_name)
-                if broadcast:
-                    broadcast({
-                        "type": "updateSetting",
-                        "key": "model",
-                        "value": model_name,
-                    })
-
-            if max_budget is not None:
-                self.max_budget = float(max_budget)
-                _apply_setting(updated, broadcast, "max_budget", self.max_budget)
-
-            if use_web_browser is not None:
-                self._use_web_tools = bool(use_web_browser)
-                _apply_setting(
-                    updated, broadcast, "use_web_browser", self._use_web_tools,
-                )
-
-            if remote_password is not None:
-                # Mask the secret in both the summary and the broadcast.
-                _apply_setting(
-                    updated, broadcast, "remote_password", remote_password,
-                    label="remote_password=<updated>", broadcast_value=True,
-                )
-
-            if demo_mode is not None:
-                _apply_setting(updated, broadcast, "demo_mode", bool(demo_mode))
-
-            if auto_commit is not None and not auto_commit:
-                # ``auto_commit`` is a one-shot action: ``False`` requests no
-                # commit, but it is still a provided argument and must be
-                # reported accurately (not as "all arguments were None").
-                updated.append("auto_commit=not triggered (False)")
-            elif auto_commit is not None and bool(auto_commit):
-                # Special-cased: a one-shot action (commit pending changes),
-                # not a persisted config value.
-                updated.append("auto_commit=triggered")
-                try:
-                    from kiss.agents.sorcar.git_worktree import GitWorktreeOps
-
-                    wd = Path(self.work_dir).resolve()
-                    if GitWorktreeOps.discover_repo(wd):
-                        auto_commit_changes(
-                            wd,
-                            getattr(self, "_last_user_prompt", "") or None,
-                            _generate_commit_message,
-                        )
-                except Exception:
-                    pass
-                if broadcast:
-                    broadcast({
-                        "type": "updateSetting",
-                        "key": "auto_commit",
-                        "value": True,
-                    })
-
-            if custom_endpoint is not None:
-                _apply_setting(updated, broadcast, "custom_endpoint", custom_endpoint)
-
-            if custom_headers is not None:
-                # Mask the header values in both the summary and broadcast.
-                _apply_setting(
-                    updated, broadcast, "custom_headers", custom_headers,
-                    label="custom_headers=<updated>", broadcast_value=True,
-                )
-
-            if not updated:
-                return "No settings were changed (all arguments were None)."
-            return "Updated: " + ", ".join(updated)
-
         def number_of_cores() -> int:
             """Return the number of CPU cores available on the current machine.
 
@@ -531,7 +429,11 @@ class SorcarAgent(RelentlessAgent):
             return os.process_cpu_count() or 1
 
         def set_model(model_name: str) -> str:
-            """Change the agent's LLM model dynamically.
+            """Change only this running agent's LLM model dynamically.
+
+            This does not persist ``last_model`` and therefore cannot
+            change the user-facing model picker default.  Only an
+            explicit picker selection should update that preference.
 
             Args:
                 model_name: New LLM model name (for example
@@ -543,12 +445,9 @@ class SorcarAgent(RelentlessAgent):
                 change (or a "no change" message when the requested
                 model is already active).
             """
-            from kiss.agents.sorcar.persistence import _save_last_model
-
             old_model = getattr(self, "model", None)
             if old_model is None:
                 self.model_name = model_name
-                _save_last_model(model_name)
                 return (
                     f"Model deferred-changed to {model_name} "
                     "(no live model yet)."
@@ -592,7 +491,6 @@ class SorcarAgent(RelentlessAgent):
                 self._cached_tools_schema = new_model._build_openai_tools_schema(  # type: ignore[attr-defined]
                     self.function_map,
                 )
-            _save_last_model(model_name)
             return f"Model changed from {previous_name} to {model_name}."
 
         # Agent Skills (https://agentskills.io): the tool's docstring
@@ -613,7 +511,6 @@ class SorcarAgent(RelentlessAgent):
         except Exception:
             logger.warning("MCP tool setup failed", exc_info=True)
         tools.append(ask_user_question)
-        tools.append(update_settings)
         tools.append(set_model)
         if self._is_parallel:
             tools.append(run_parallel)

@@ -21,6 +21,12 @@ import {
   daemonHasActiveTasks,
   decideRestart,
 } from './daemonHealth';
+import {
+  showErrorNotification,
+  showInformationNotification,
+  showWarningNotification,
+  withWebviewNotificationProgress,
+} from './WebviewNotifications';
 
 const HOME_DIR = process.env.HOME || process.env.USERPROFILE || '';
 const LOG_DIR = path.join(HOME_DIR, '.kiss');
@@ -453,8 +459,15 @@ async function runFinalization(
     installCliScript(kissProjectPath, uvPath);
   }
 
-  if (progress) progress.report({message: 'Refreshing model info...'});
+  // MODEL_INFO.json is intentionally NOT copied into ``~/.kiss/``;
+  // see the docstring on ``installModelInfoJson`` below for the
+  // rationale.  User overrides live in ``~/.kiss/MY_MODELS.json``,
+  // auto-seeded by ``kiss.core.models.model_info`` on first import.
   installModelInfoJson(kissProjectPath);
+  // INJECTIONS.md is intentionally NOT copied into ``~/.kiss/``; see
+  // the docstring on ``installMarkdownAssets`` below for the
+  // rationale.  ``MY_INJECTION.md`` is lazily seeded by
+  // ``ensureUserAssetFromDefault`` on the first ``getTricks()`` call.
   installMarkdownAssets(kissProjectPath);
 
   if (progress) progress.report({message: 'Checking cloudflared...'});
@@ -521,7 +534,7 @@ async function ensureDependenciesImpl(): Promise<void> {
   const kissProjectPath = findKissProject();
   if (!kissProjectPath) {
     log('KISS project not found — skipping dependency setup');
-    vscode.window.showErrorMessage(
+    showErrorNotification(
       'KISS Sorcar: Could not find the KISS project directory. ' +
         'Please set "kissSorcar.kissProjectPath" in VS Code settings. ' +
         'See ~/.kiss/install.log for details.',
@@ -618,7 +631,7 @@ async function ensureDependenciesImpl(): Promise<void> {
         // browsers are cached system-wide (outside .venv), so a transient
         // background update failure is benign when chromium is already cached.
         if (!isChromiumInstalled()) {
-          vscode.window.showWarningMessage(
+          showWarningNotification(
             'KISS Sorcar: Chromium browser update failed in background. See ~/.kiss/install.log for details.',
           );
         }
@@ -627,7 +640,7 @@ async function ensureDependenciesImpl(): Promise<void> {
     if (!gitWorks()) {
       void installGit().then(installed => {
         if (!installed) {
-          vscode.window.showWarningMessage(
+          showWarningNotification(
             `KISS Sorcar: git is not available. ${gitInstallHint()}`,
           );
         }
@@ -636,7 +649,7 @@ async function ensureDependenciesImpl(): Promise<void> {
     if (!commandExists('node')) {
       void installNode().then(installed => {
         if (!installed) {
-          vscode.window.showWarningMessage(
+          showWarningNotification(
             'KISS Sorcar: Node.js could not be installed automatically. Some agent tools may be unavailable.',
           );
         }
@@ -655,7 +668,7 @@ async function ensureDependenciesImpl(): Promise<void> {
     apiKeysReady = await runFinalization(null, kissProjectPath, uvPath);
   } else {
     // Slow path: show progress bar and install missing deps
-    const result = await vscode.window.withProgress(
+    const result = await withWebviewNotificationProgress(
       {
         location: vscode.ProgressLocation.Notification,
         title: 'KISS Sorcar: Setting up',
@@ -668,7 +681,7 @@ async function ensureDependenciesImpl(): Promise<void> {
           if (process.platform !== 'win32') {
             for (const bin of ['curl', 'tar']) {
               if (!commandExists(bin)) {
-                vscode.window.showErrorMessage(
+                showErrorNotification(
                   `KISS Sorcar: '${bin}' is required to install uv but was not found. Please install '${bin}' and restart VS Code.`,
                 );
                 return {success: false, apiKeysReady: false};
@@ -681,7 +694,7 @@ async function ensureDependenciesImpl(): Promise<void> {
           });
           uvPath = await installUv();
           if (!uvPath) {
-            vscode.window.showErrorMessage(
+            showErrorNotification(
               'KISS Sorcar: Failed to install uv. Install manually: curl -LsSf https://astral.sh/uv/install.sh | sh',
             );
             return {success: false, apiKeysReady: false};
@@ -694,7 +707,7 @@ async function ensureDependenciesImpl(): Promise<void> {
           progress.report({message: 'Installing git...'});
           const gitInstalled = await installGit();
           if (!gitInstalled) {
-            vscode.window.showWarningMessage(
+            showWarningNotification(
               `KISS Sorcar: git could not be installed automatically. ${gitInstallHint()}`,
             );
           }
@@ -706,7 +719,7 @@ async function ensureDependenciesImpl(): Promise<void> {
           const nodeInstalled = await installNode();
           if (!nodeInstalled) {
             log('Node.js could not be installed automatically');
-            vscode.window.showWarningMessage(
+            showWarningNotification(
               'KISS Sorcar: Node.js could not be installed automatically. ' +
                 'Some agent tools may be unavailable. Install from https://nodejs.org',
             );
@@ -734,7 +747,7 @@ async function ensureDependenciesImpl(): Promise<void> {
 
         // 6. Verify Python version meets minimum requirement
         if (checkPythonVersion(uvPath, kissProjectPath) !== 'ok') {
-          vscode.window.showErrorMessage(
+          showErrorNotification(
             `KISS Sorcar requires Python ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}+. ` +
               `Please install Python ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR} or later and restart VS Code.`,
           );
@@ -808,12 +821,11 @@ async function ensureDependenciesImpl(): Promise<void> {
   // non-prompting info message instead of forcing a reload.
   if (showRestartNotification) {
     if (apiKeysReady) {
-      vscode.window.showInformationMessage(
-        'KISS Sorcar: Installation complete! You are ready to go. ' +
-          'Already-open terminals will not see the updated PATH until you open a new one.',
+      showInformationNotification(
+        'KISS Sorcar: Installation complete! Starting server in less than 1 minute ... ',
       );
     } else {
-      vscode.window.showWarningMessage(
+      showWarningNotification(
         'KISS Sorcar: Installation complete, but at least one of Claude Code, ANTHROPIC_API_KEY, or OPENAI_API_KEY is required. ' +
           'Set an API key in your environment, then reload the window (Developer: Reload Window) to be prompted again.',
       );
@@ -1313,75 +1325,66 @@ function computeKissWebFingerprint(
 }
 
 /**
- * Always overwrite ``~/.kiss/INJECTIONS.md`` and ``~/.kiss/SAMPLE_TASKS.md``
- * with the copies bundled inside the installed kiss_project.  Called on
- * every install/update (both fast and slow paths in ``runFinalization``) so
- * that the kiss-web daemon's Tricks button and the VS Code extension's
- * welcome-screen sample-task chips always reflect the latest bundled
- * Markdown after a version upgrade — matching the ``installModelInfoJson``
- * pattern.  Failures are logged and swallowed so a read-only ``~/.kiss/``
- * cannot break the overall install flow.
+ * No-op install step retained for log narrative.
+ *
+ * ``INJECTIONS.md`` is **intentionally NOT copied** into
+ * ``~/.kiss/``.  The bundled ``src/kiss/INJECTIONS.md`` is read
+ * directly from the installed package at runtime by
+ * ``kiss.agents.vscode.tricks.read_tricks`` (Python, daemon) and
+ * ``getTricks`` in ``SorcarTab.ts`` (TypeScript, extension), so every
+ * version upgrade automatically delivers the latest bundled tricks
+ * without clobbering user edits.
+ *
+ * User-curated tricks live in ``~/.kiss/MY_INJECTION.md`` —
+ * auto-seeded on first read with the single ``## Trick`` starter
+ * ("Write end-to-end 100% coverage tests for the feature first.  Then
+ * implement the feature.") — matching the ``MY_TASK_TEMPLATES.md`` /
+ * ``SAMPLE_TASKS.md`` pattern.
+ *
+ * ``SAMPLE_TASKS.md`` is similarly NOT copied: the welcome-screen
+ * chip loader (``readSampleTasks`` in ``SorcarTab.ts``) reads the
+ * bundled package copy directly, while user-curated chips live in
+ * ``~/.kiss/MY_TASK_TEMPLATES.md``.
+ *
+ * The function is preserved (as a no-op) so the call site in
+ * ``runFinalization`` keeps documenting why no markdown asset copy
+ * happens at install time.
  */
 function installMarkdownAssets(kissProjectPath: string): void {
+  // Reference kissProjectPath so TypeScript does not flag the
+  // documented parameter as unused while we keep the install-time
+  // narrative comment alive for future maintainers.
+  void kissProjectPath;
   if (!HOME_DIR) return;
-  const kissHomeDir = LOG_DIR; // ~/.kiss
-  const assets: Array<[string, string]> = [
-    [
-      path.join(kissProjectPath, 'src', 'kiss', 'INJECTIONS.md'),
-      path.join(kissHomeDir, 'INJECTIONS.md'),
-    ],
-    [
-      path.join(kissProjectPath, 'src', 'kiss', 'SAMPLE_TASKS.md'),
-      path.join(kissHomeDir, 'SAMPLE_TASKS.md'),
-    ],
-  ];
-  for (const [src, dst] of assets) {
-    try {
-      if (!fs.existsSync(src)) {
-        log(`${path.basename(src)} not found at ${src}; skipping copy`);
-        continue;
-      }
-      fs.mkdirSync(kissHomeDir, {recursive: true});
-      fs.copyFileSync(src, dst);
-      log(`Installed ${path.basename(src)} at ${dst}`);
-    } catch (e: unknown) {
-      log(`Failed to install ${path.basename(src)}: ${(e as Error).message}`);
-    }
-  }
+  log(
+    'INJECTIONS.md is read directly from the bundled package; ' +
+      'no copy is made into ~/.kiss/ (user tricks live in MY_INJECTION.md).',
+  );
 }
 
 /**
- * Copy the kiss_project's bundled ``MODEL_INFO.json`` to
- * ``~/.kiss/MODEL_INFO.json``.  The Python loader in
- * ``kiss.core.models.model_info`` reads the user-local copy at runtime
- * (with an mtime-based auto-refresh from the package copy), so seeding
- * it here on every install means the freshly installed extension serves
- * the up-to-date pricing/context table immediately.  Failures are logged
- * and swallowed: model_info.py's loader falls back to the package copy
- * if ~/.kiss/MODEL_INFO.json is missing or unreadable.
+ * ``MODEL_INFO.json`` is intentionally NOT copied into ``~/.kiss/``.
+ *
+ * The bundled ``src/kiss/core/models/MODEL_INFO.json`` is the runtime
+ * source of truth for shipped model pricing/context tables; the Python
+ * loader in ``kiss.core.models.model_info`` reads it directly from the
+ * installed package.  User-curated overrides / extensions live in
+ * ``~/.kiss/MY_MODELS.json`` instead, auto-seeded on first import with
+ * a short documentation block and a commented-out example entry —
+ * matching the ``MY_INJECTION.md`` / ``MY_TASK_TEMPLATES.md`` pattern.
+ *
+ * The function is preserved (as a no-op) so the call site in
+ * ``runFinalization`` keeps documenting why no MODEL_INFO.json copy
+ * happens at install time.
  */
 function installModelInfoJson(kissProjectPath: string): void {
+  void kissProjectPath;
   if (!HOME_DIR) return;
-  const src = path.join(
-    kissProjectPath,
-    'src',
-    'kiss',
-    'core',
-    'models',
-    'MODEL_INFO.json',
+  log(
+    'MODEL_INFO.json is read directly from the bundled package; no copy is ' +
+      'made into ~/.kiss/ (user model overrides live in MY_MODELS.json, ' +
+      'auto-seeded on first import by kiss.core.models.model_info).',
   );
-  const dst = path.join(LOG_DIR, 'MODEL_INFO.json');
-  try {
-    if (!fs.existsSync(src)) {
-      log(`MODEL_INFO.json not found at ${src}; skipping copy`);
-      return;
-    }
-    fs.mkdirSync(LOG_DIR, {recursive: true});
-    fs.copyFileSync(src, dst);
-    log(`Installed MODEL_INFO.json at ${dst}`);
-  } catch (e: unknown) {
-    log(`Failed to install MODEL_INFO.json: ${(e as Error).message}`);
-  }
 }
 
 /**
@@ -2260,7 +2263,7 @@ async function promptForApiKey(
 
     if (key === undefined) {
       if (!optional) {
-        const choice = await vscode.window.showWarningMessage(
+        const choice = await showWarningNotification(
           `${displayName} is required for KISS Sorcar to function.`,
           'Enter Key',
           'Skip',
@@ -2278,7 +2281,7 @@ async function promptForApiKey(
     }
 
     if (validate) {
-      const valid = await vscode.window.withProgress(
+      const valid = await withWebviewNotificationProgress(
         {
           location: vscode.ProgressLocation.Notification,
           title: `Validating ${displayName}...`,
@@ -2287,7 +2290,7 @@ async function promptForApiKey(
       );
 
       if (!valid) {
-        const choice = await vscode.window.showWarningMessage(
+        const choice = await showWarningNotification(
           `The ${displayName} is not valid. Please try again.`,
           'Try Again',
           'Cancel',
@@ -2407,7 +2410,7 @@ async function ensureApiKeys(): Promise<boolean> {
     if (hasAnyKey()) break;
 
     // No key provided — warn and offer retry
-    const choice = await vscode.window.showWarningMessage(
+    const choice = await showWarningNotification(
       'KISS Sorcar requires Claude Code, ANTHROPIC_API_KEY, or OPENAI_API_KEY to work.',
       'Enter Key',
       'Skip',
@@ -2590,7 +2593,7 @@ async function ensureRemotePassword(): Promise<void> {
   });
 
   if (password === undefined || password.trim() === '') {
-    vscode.window.showInformationMessage(
+    showInformationNotification(
       'KISS Sorcar: You can set the remote access password later in the ' +
         'KISS Sorcar settings panel (Remote password field).',
     );

@@ -53,6 +53,83 @@ REQUIRED_NODE_VERSION="${NODE_VERSION#v}"
 mkdir -p "$BIN_DIR" "$LOG_DIR"
 export PATH="$BIN_DIR:$PATH"
 
+# ---------------------------------------------------------------------------
+# Signal handling
+#
+# A previous regression looked like::
+#
+#     >>> [5/6] Building VS Code extension...
+#     npm warn deprecated prebuild-install@7.1.3: No longer maintained. ...
+#     ^C
+#
+# i.e. the install aborted right after npm ci's first deprecation warning.
+# `npm ci` can sit silent for tens of seconds between log lines while it
+# fetches/extracts tarballs — long enough for the user (or a stray signal
+# from a backgrounded shell / sleeping laptop / closed terminal tab) to
+# kill the script just as it was about to make progress.
+#
+# Trap SIGINT/SIGTERM at the bash level so a single stray signal prints a
+# diagnostic instead of silently terminating, and so the user can see how
+# far they got.  A *second* signal within 3 s is honored as a real abort.
+# ---------------------------------------------------------------------------
+LAST_SIGNAL_TS=0
+handle_interrupt() {
+    local now
+    now=$(date +%s)
+    if [ $((now - LAST_SIGNAL_TS)) -lt 3 ]; then
+        echo ""
+        echo "   Second interrupt received — aborting install."
+        echo "   Re-run 'bash $0' to resume; the build cache is preserved."
+        exit 130
+    fi
+    LAST_SIGNAL_TS=$now
+    echo ""
+    echo "   ⚠ Interrupt received but ignored — long npm/git steps can sit"
+    echo "      silent for 30-60 s while they download or extract.  Press"
+    echo "      Ctrl+C again within 3 s to really abort."
+}
+trap handle_interrupt INT TERM
+
+# Run "$@" while printing a heartbeat every HEARTBEAT_INTERVAL seconds so
+# the user can tell the install is still working.  Without this the npm ci
+# step can sit silent for ~1 min and look hung.  Exit code is forwarded
+# from the wrapped command.
+HEARTBEAT_INTERVAL="${KISS_HEARTBEAT_INTERVAL:-15}"
+run_with_heartbeat() {
+    local label="$1"
+    shift
+    local start
+    start=$(date +%s)
+    # Run the command in the background and capture its PID.  We do NOT
+    # exec it because we need to wait for it explicitly to harvest the
+    # exit code through ``wait``.
+    "$@" &
+    local cmd_pid=$!
+    # Heartbeat loop runs in its own subshell so a failing ``sleep`` (rare)
+    # cannot abort the parent script under ``set -e``.
+    (
+        set +e
+        while kill -0 "$cmd_pid" 2>/dev/null; do
+            sleep "$HEARTBEAT_INTERVAL"
+            if kill -0 "$cmd_pid" 2>/dev/null; then
+                local elapsed=$(( $(date +%s) - start ))
+                printf "   … %s still running (%ds elapsed)\n" "$label" "$elapsed"
+            fi
+        done
+    ) &
+    local hb_pid=$!
+    # Use ``+e`` so a non-zero exit from the wrapped command is returned to
+    # the caller instead of aborting the whole script — callers (e.g. the
+    # npm ci retry loop) need to inspect the exit code.
+    set +e
+    wait "$cmd_pid"
+    local rc=$?
+    set -e
+    kill "$hb_pid" 2>/dev/null || true
+    wait "$hb_pid" 2>/dev/null || true
+    return $rc
+}
+
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 case "$OS" in
@@ -628,8 +705,30 @@ update_repo() {
     echo "   Pulling latest changes..."
     # Non-fatal: offline machines must still be able to rebuild/reinstall
     # from the current checkout instead of crashing under `set -e`.
-    git -C "$PROJECT_DIR" pull --ff-only || git -C "$PROJECT_DIR" pull \
-        || echo "   WARNING: git pull failed (offline or diverged); continuing with the current checkout."
+    #
+    # Strategy:
+    #   1. ``git fetch`` so we know the remote state even if the working tree
+    #      ends up untouched.
+    #   2. Try a fast-forward pull (the common, safe case).
+    #   3. If fast-forward fails, the local branch has diverged from upstream
+    #      — typically because the remote was force-pushed (e.g. release
+    #      retag).  Reset hard to the upstream tip so the "Update" action in
+    #      the settings panel actually updates.  Any local edits were already
+    #      stashed above, so this is non-destructive.
+    if ! git -C "$PROJECT_DIR" fetch --tags --prune origin 2>/dev/null; then
+        echo "   WARNING: git fetch failed (offline?); continuing with the current checkout."
+        return 0
+    fi
+    if git -C "$PROJECT_DIR" pull --ff-only; then
+        return 0
+    fi
+    if git -C "$PROJECT_DIR" rev-parse --abbrev-ref '@{upstream}' &>/dev/null; then
+        echo "   Branches diverged (upstream likely force-pushed) — resetting to upstream..."
+        git -C "$PROJECT_DIR" reset --hard '@{upstream}' \
+            || echo "   WARNING: git reset to upstream failed; continuing with the current checkout."
+    else
+        echo "   WARNING: no upstream tracking branch; continuing with the current checkout."
+    fi
 }
 
 {
@@ -740,18 +839,48 @@ update_repo() {
     VSCODE_EXT_DIR="$PROJECT_DIR/src/kiss/agents/vscode"
     VSIX="$VSCODE_EXT_DIR/kiss-sorcar.vsix"
     cd "$VSCODE_EXT_DIR"
+    # npm ci flags — chosen so a fresh OR repeat run cannot hang:
+    #
     # --ignore-scripts: the lockfile's only packages with install scripts are
-    # `keytar` (an *optional*, lazily-imported dep of @vscode/vsce used solely
-    # for publish credentials — never by `vsce package`) and
-    # `@vscode/vsce-sign` (signing only).  keytar's install script runs
-    # `prebuild-install || node-gyp rebuild`, which downloads from the
-    # archived atom/node-keytar GitHub releases (or compiles natively) and can
-    # block forever with no output — hanging the Update button's install at
-    # "[5/6] Building VS Code extension..." right after npm's deprecation
-    # warnings.  Neither script is needed to compile and package the VSIX.
+    #   `keytar` (an *optional*, lazily-imported dep of @vscode/vsce used
+    #   solely for publish credentials — never by `vsce package`) and
+    #   `@vscode/vsce-sign` (signing only).  keytar's install script runs
+    #   `prebuild-install || node-gyp rebuild`, which downloads from the
+    #   archived atom/node-keytar GitHub releases (or compiles natively) and
+    #   can block forever with no output — hanging the Update button's
+    #   install at "[5/6] Building VS Code extension..." right after npm's
+    #   deprecation warnings.  Neither script is needed to compile and
+    #   package the VSIX.
+    #
+    # --omit=optional: matches the release scripts.  Skips keytar entirely
+    #   (it is an *optional* dep of @vscode/vsce), so even npm's
+    #   "deprecated prebuild-install" warning — the last line many users
+    #   saw before the script appeared to hang — is gone.
+    #
+    # --prefer-offline: re-runs reuse the npm cache populated by the
+    #   previous attempt instead of re-downloading the whole dependency
+    #   tree.  Critical for the Update button: when a user re-runs the
+    #   script after an interrupted attempt, the second run is ~10× faster
+    #   because every tarball is already in ~/.npm.
+    #
     # --no-audit --no-fund skip more network round-trips and noise.
-    npm ci --ignore-scripts --no-audit --no-fund
-    npm run package
+    NPM_CI_FLAGS=(--ignore-scripts --omit=optional --prefer-offline --no-audit --no-fund)
+    echo "   Installing extension dependencies (npm ci)..."
+    echo "   This typically takes 30–90 s the first time and ~10 s on re-runs."
+    # Retry once on transient failure (network blip, mirror flake).  The
+    # heartbeat wrapper makes sure the user sees elapsed-time output every
+    # ~15 s, so a silent stretch of npm output no longer looks like a hang.
+    if ! run_with_heartbeat "npm ci" npm ci "${NPM_CI_FLAGS[@]}"; then
+        echo "   npm ci failed — retrying once with a clean node_modules..."
+        rm -rf node_modules
+        run_with_heartbeat "npm ci (retry)" npm ci "${NPM_CI_FLAGS[@]}"
+    fi
+    echo "   Compiling extension TypeScript..."
+    run_with_heartbeat "tsc" npm run compile
+    echo "   Copying bundled KISS runtime..."
+    run_with_heartbeat "copy-kiss" npm run copy-kiss
+    echo "   Packaging VSIX..."
+    run_with_heartbeat "vsce package" npm run package
     cd "$PROJECT_DIR"
     if [ ! -f "$VSIX" ]; then
         echo "   ERROR: Failed to build VSIX"
@@ -839,50 +968,40 @@ update_repo() {
     # client that is mid-flight during the launchd/systemd respawn window.
     rm -f "$HOME/.kiss/sorcar.sock"
 
-    # Copy the bundled MODEL_INFO.json into ~/.kiss/ so the freshly installed
-    # extension serves the latest model pricing/context table on startup
-    # without waiting for ``model_info.py``'s lazy auto-copy.  The Python
-    # loader in ``kiss.core.models.model_info`` also auto-refreshes when the
-    # package copy is newer, but doing it here makes the data the user sees
-    # match the just-installed source immediately.
-    MODEL_INFO_SRC="$PROJECT_DIR/src/kiss/core/models/MODEL_INFO.json"
-    MODEL_INFO_DST="$HOME/.kiss/MODEL_INFO.json"
-    if [ -f "$MODEL_INFO_SRC" ]; then
-        cp "$MODEL_INFO_SRC" "$MODEL_INFO_DST"
-        echo "   Installed MODEL_INFO.json at $MODEL_INFO_DST"
-    else
-        echo "   WARNING: $MODEL_INFO_SRC missing — model table not refreshed."
-    fi
-
-    # Always overwrite the bundled INJECTIONS.md and SAMPLE_TASKS.md into
-    # the user's kiss home directory on every install/update.  This ensures
-    # the kiss-web daemon's Tricks button and the VS Code extension's
-    # welcome-screen sample-task chips always reflect the latest bundled
-    # Markdown when the extension is updated — matching the MODEL_INFO.json
-    # pattern directly above.
+    # MODEL_INFO.json is intentionally NOT copied into the user's kiss
+    # home directory.  The bundled
+    # ``src/kiss/core/models/MODEL_INFO.json`` is read directly from
+    # the installed package at runtime by ``kiss.core.models.model_info``,
+    # so every extension upgrade automatically delivers the latest model
+    # pricing/context table without leaving a stale user-side copy
+    # shadowing the freshly installed bundled file.
     #
-    # ``${KISS_HOME:-$HOME/.kiss}`` matches the runtime resolution in
-    # ``user_assets.kiss_home_dir`` so a developer with a custom
-    # ``KISS_HOME`` exported lands the files where the runtime will
-    # read them.
+    # User-curated model overrides / extensions live in
+    # ``~/.kiss/MY_MODELS.json`` — auto-seeded on first import with a
+    # short documentation block and one commented-out example entry —
+    # matching the ``MY_INJECTION.md`` / ``MY_TASK_TEMPLATES.md`` pattern.
+    #
+    # Re-introducing the copy here would mean a stale user-side
+    # ``~/.kiss/MODEL_INFO.json`` shadowing the freshly installed
+    # bundled file forever after the first install.
+
+    # INJECTIONS.md is intentionally NOT copied into the user's kiss
+    # home directory.  The bundled ``src/kiss/INJECTIONS.md`` is read
+    # directly from the installed package at runtime by
+    # ``kiss.agents.vscode.tricks.read_tricks`` and ``getTricks`` in
+    # ``SorcarTab.ts``, so every extension upgrade automatically
+    # delivers the latest bundled tricks without clobbering user
+    # edits.  User-curated tricks live in ``~/.kiss/MY_INJECTION.md``
+    # — auto-seeded on first read with a single ``## Trick`` starter
+    # ("Write end-to-end 100% coverage tests for the feature first.
+    # Then implement the feature.") — matching the
+    # ``MY_TASK_TEMPLATES.md`` / ``SAMPLE_TASKS.md`` pattern.
+    #
+    # Re-introducing the copy here would mean a stale user-side
+    # ``~/.kiss/INJECTIONS.md`` shadowing the freshly installed
+    # bundled file forever after the first install.
     KISS_HOME_DIR="${KISS_HOME:-$HOME/.kiss}"
     mkdir -p "$KISS_HOME_DIR"
-    INJECTIONS_SRC="$PROJECT_DIR/src/kiss/INJECTIONS.md"
-    INJECTIONS_DST="$KISS_HOME_DIR/INJECTIONS.md"
-    if [ -f "$INJECTIONS_SRC" ]; then
-        cp "$INJECTIONS_SRC" "$INJECTIONS_DST"
-        echo "   Installed INJECTIONS.md at $INJECTIONS_DST"
-    else
-        echo "   WARNING: $INJECTIONS_SRC missing — tricks not refreshed."
-    fi
-    SAMPLE_TASKS_SRC="$PROJECT_DIR/src/kiss/SAMPLE_TASKS.md"
-    SAMPLE_TASKS_DST="$KISS_HOME_DIR/SAMPLE_TASKS.md"
-    if [ -f "$SAMPLE_TASKS_SRC" ]; then
-        cp "$SAMPLE_TASKS_SRC" "$SAMPLE_TASKS_DST"
-        echo "   Installed SAMPLE_TASKS.md at $SAMPLE_TASKS_DST"
-    else
-        echo "   WARNING: $SAMPLE_TASKS_SRC missing — welcome chips not refreshed."
-    fi
 
     date -u +%Y-%m-%dT%H:%M:%SZ > "$HOME/.kiss/.extension-updated"
     # Remove any stale source-install marker from older versions of this

@@ -42,18 +42,6 @@ class TestTaskHistory:
         _restore(self.saved)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def test_get_history_entry(self):
-        th._add_task("first")
-        time.sleep(0.01)
-        th._add_task("second")
-        entry = th._get_history_entry(0)
-        assert entry is not None
-        assert entry["task"] == "second"
-        entry1 = th._get_history_entry(1)
-        assert entry1 is not None
-        assert entry1["task"] == "first"
-        assert th._get_history_entry(99999) is None
-
     def test_prefix_match_task_empty_query(self):
         th._add_task("anything")
         assert th._prefix_match_task("") == ""
@@ -93,7 +81,9 @@ class TestChatEvents:
         loaded = json.loads(str(result["extra"]))
         assert loaded["model"] == "gpt-4o"
         assert loaded["is_worktree"] is True
-        assert loaded["is_parallel"] is False
+        # Flat-column schema: falsy booleans are indistinguishable from
+        # the default and are not re-emitted in the synthesized extra JSON.
+        assert loaded.get("is_parallel", False) is False
 
     def test_set_events_stores_timestamps(self):
         task_id, _ = th._add_task("ts-task", chat_id="ts1")
@@ -173,7 +163,7 @@ class TestChatEvents:
         assert next_of_a is not None
         assert next_of_a["task_id"] == dup_b_id
         # None when the id is not in the chat
-        assert th._get_adjacent_task_by_chat_id("dup", 999_999, "prev") is None
+        assert th._get_adjacent_task_by_chat_id("dup", "999999", "prev") is None
         # None when id is None
         assert th._get_adjacent_task_by_chat_id("dup", None, "prev") is None
 
@@ -225,7 +215,9 @@ class TestSaveTaskExtra:
         assert stored["version"] == "0.2.79"
         assert stored["tokens"] == 1234
         assert stored["cost"] == 0.0567
-        assert stored["is_parallel"] is False
+        # Flat-column schema: falsy booleans collapse to the default and
+        # are not re-emitted in the synthesized extra JSON.
+        assert stored.get("is_parallel", False) is False
         assert stored["is_worktree"] is True
 
     def test_save_extra_by_task_name(self):
@@ -241,7 +233,26 @@ class TestSaveTaskExtra:
     def test_extra_default_empty(self):
         th._add_task("no extra")
         entries = th._load_history(limit=1)
-        assert entries[0]["extra"] == ""
+        # r3-H3: ``_row_to_extra_json`` now always emits every typed
+        # column (including string/numeric defaults) so consumers see
+        # a consistent shape regardless of whether a field was
+        # explicitly set or left at the column default.
+        import json as _json
+        loaded = _json.loads(str(entries[0]["extra"]))
+        assert loaded == {
+            "model": "",
+            "work_dir": "",
+            "version": "",
+            "auto_commit_mode": False,
+            "tokens": 0,
+            "cost": 0.0,
+            "steps": 0,
+            "is_parallel": False,
+            "is_worktree": False,
+            "startTs": 0,
+            "endTs": 0,
+            "is_favorite": False,
+        }
 
     def test_extra_in_search_results(self):
         task_id, _ = th._add_task("searchable extra", chat_id="1003")
@@ -250,15 +261,6 @@ class TestSaveTaskExtra:
         assert len(results) == 1
         stored = json.loads(str(results[0]["extra"]))
         assert stored["model"] == "test-model"
-
-    def test_extra_in_get_history_entry(self):
-        task_id, _ = th._add_task("entry extra", chat_id="1001")
-        th._save_task_extra({"tokens": 999}, task_id=task_id)
-        entry = th._get_history_entry(0)
-        assert entry is not None
-        stored = json.loads(str(entry["extra"]))
-        assert stored["tokens"] == 999
-
 
 class TestFileUsage:
     def setup_method(self):

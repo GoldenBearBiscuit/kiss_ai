@@ -115,11 +115,12 @@ ______________________________________________________________________
   - `ask_user_question_callback`: Optional callback used by the ask_user_question tool to collect a text response from the user.
   - **Returns:** YAML string with 'success' and 'summary' keys.
 
-**`auto_commit_changes`** — Stage all changes, generate a commit message, and commit. Stages all changes once, generates a commit message from the staged diff via *message_fn*, then commits the already-staged changes (without re-staging). Falls back to a generic commit message when *message_fn* raises (e.g. the LLM-based generator is unavailable).<br/>`def auto_commit_changes(commit_dir: Path, user_prompt: str | None, message_fn: Callable[[Path, str | None], str]) -> bool`
+**`auto_commit_changes`** — Stage all changes, generate a commit message, and commit. Stages once so *message_fn* can compute the diff, runs *message_fn* (typically a slow LLM call) to generate the commit subject/body, then re-stages immediately before the commit so any file that appeared in the worktree during the LLM call (e.g. `PROGRESS.md` rewrites, macOS `.DS_Store` materializing after an `open` of the report, an editor side-channel saving swap files) is included in the same commit. Without the second `stage_all` those late-arriving files would be left uncommitted, `_finalize_worktree` would see them via `has_uncommitted_changes` and abort the auto-merge with the misleading "pre-commit hook may have rejected" warning (observed in production on 2026-06-26 07:23:14 for worktree `kiss_wt-1782483430-cb03445c` even though the repo had no custom pre-commit hooks installed). Falls back to a generic commit message when *message_fn* raises (e.g. the LLM-based generator is unavailable).<br/>`def auto_commit_changes(commit_dir: Path, user_prompt: str | None, message_fn: Callable[[Path, str | None], str], notify_fn: Callable[[str, str], None] | None = None) -> bool`
 
 - `commit_dir`: Directory whose changes are staged and committed.
 - `user_prompt`: The user's task prompt, woven into the commit message (or its fallback), or `None` when unavailable.
 - `message_fn`: Callable producing a commit message from `(commit_dir, user_prompt)`.
+- `notify_fn`: Optional UI callback invoked at two life-cycle points so the chat webview can render toasts: - `notify_fn("generating", "")` immediately before *message_fn* runs (typically a slow LLM call) so the user sees "Generating commit message" while the LLM works. - `notify_fn("committed", subject)` immediately after a successful commit, where *subject* is the first non-empty line of the committed message. Both hooks are SKIPPED when there is nothing to commit (no staged diff after the initial `stage_all`), so the webview never sees a misleading "Generating commit message" toast without a follow-up. The "committed" hook is also not invoked when `commit_staged` returns `False` after *message_fn* (e.g. pre-commit hook rejected the commit). All `notify_fn` exceptions are swallowed so a broken UI hook can never block the commit itself.
 - **Returns:** True if a commit was created, False if nothing to commit.
 
 **`run_tasks_parallel`** — Execute multiple SorcarAgent tasks concurrently using threads. Each task gets its own `ChatSorcarAgent` instance and runs in a separate thread via :class:`~concurrent.futures.ThreadPoolExecutor`. This is ideal for I/O-bound workloads (LLM API calls, network requests) where the GIL is released during I/O waits. This helper is a pure parallel executor: it has no knowledge of backend task ids or any frontend concepts. It simply marks each spawned agent as a sub-agent (via `_subagent_info`) and the sub-agent itself owns any sub-agent-specific behaviour (such as broadcasting `new_tab` to a browser-based frontend) inside its own `run()` method.<br/>`def run_tasks_parallel(tasks: list[str], max_workers: int | None = None, model_name: str | None = None, work_dir: str | None = None, printer: Printer | None = None, totals_out: dict[str, float] | None = None) -> list[str]`
@@ -142,10 +143,6 @@ ______________________________________________________________________
 - **chat_id** — Return the current chat session ID ("" means new session).<br/>`chat_id() -> str` *(property)*
 
 - **new_chat** — Reset to a new chat session (equivalent to VS Code 'Clear').<br/>`new_chat() -> None`
-
-- **resume_chat** — Resume a previous chat session by looking up the task's chat_id. If the task has an associated `chat_id` in history, subsequent `run()` calls will continue that session.<br/>`resume_chat(task: str) -> None`
-
-  - `task`: The task description string to look up.
 
 - **resume_chat_by_id** — Resume a chat session using a stable chat identifier.<br/>`resume_chat_by_id(chat_id: str) -> None`
 
@@ -220,6 +217,11 @@ ______________________________________________________________________
   - `wt_dir`: Git working directory to check.
   - **Returns:** True if there are staged, unstaged, or untracked changes.
 
+- **status_porcelain** — Return the raw `git status --porcelain` output. Used by failure-path warnings (e.g. :meth:`~kiss.agents.sorcar.worktree_sorcar_agent.WorktreeSorcarAgent._finalize_worktree`) to embed the exact leftover files in the log so an operator can tell a real pre-commit-hook rejection apart from a race leftover or a corrupt index without having to ssh in and run git themselves.<br/>`status_porcelain(wt_dir: Path) -> str`
+
+  - `wt_dir`: Git working directory to inspect.
+  - **Returns:** The stripped porcelain output (possibly empty).
+
 - **staged_diff** — Return the staged diff text for the worktree.<br/>`staged_diff(wt_dir: Path) -> str`
 
   - `wt_dir`: Worktree directory (must have staged changes).
@@ -273,7 +275,7 @@ ______________________________________________________________________
 
   - `repo`: Git repo root path.
 
-- **ensure_scratch_merge_driver** — Install a merge driver that auto-resolves agent scratch files. `PROGRESS.md` is a tracked per-task agent log that every task wholesale rewrites ("clear PROGRESS.md when a new task begins"). Whenever main's copy diverged from the worktree's fork point, the whole-file rewrite on both sides made every three-way merge (`git merge --squash` and `git cherry-pick` alike) conflict — blocking the entire worktree merge over a scratch file. This registers a repo-local `kiss-scratch` merge driver that resolves content conflicts in such files by keeping the incoming branch's version (`%B`): the newest task's log wins, matching the clear-on-new-task convention. Installation uses only untracked plumbing — `<git_common_dir>/info/attributes` plus repo-local config — so no tracked file is ever modified, and the driver equally fixes the *manual* merge/cherry-pick commands suggested to the user on merge failure.<br/>`ensure_scratch_merge_driver(repo: Path) -> None`
+- **ensure_scratch_merge_driver** — Install a merge driver that auto-resolves agent scratch files. `PROGRESS.md` is a tracked per-task agent log that every task wholesale rewrites ("clear PROGRESS.md when a new task begins"), and `src/kiss/INJECTIONS.md` is an agent-maintained scratch prompt file that can drift between task baselines. Whenever main's copy diverged from the worktree's fork point, these scratch-file rewrites made three-way merges (`git merge --squash` and `git cherry-pick` alike) conflict — blocking the entire worktree merge over non-user source state. This registers a repo-local `kiss-scratch` merge driver that resolves content conflicts in such files by keeping the incoming branch's version (`%B`): the newest task's scratch state wins, matching the clear-on-new-task convention. Installation uses only untracked plumbing — `<git_common_dir>/info/attributes` plus repo-local config — so no tracked file is ever modified, and the driver equally fixes the *manual* merge/cherry-pick commands suggested to the user on merge failure.<br/>`ensure_scratch_merge_driver(repo: Path) -> None`
 
   - `repo`: Git repo root path.
 
@@ -296,12 +298,6 @@ ______________________________________________________________________
   - `branch`: The worktree branch name.
   - `sha`: The baseline commit SHA to store.
   - **Returns:** True if config was saved successfully, False otherwise.
-
-- **load_baseline_commit** — Load the baseline commit SHA from git config.<br/>`load_baseline_commit(repo: Path, branch: str) -> str | None`
-
-  - `repo`: Git repo root path.
-  - `branch`: The worktree branch name.
-  - **Returns:** The baseline commit SHA, or `None` if not stored (clean worktree or legacy worktree without baseline support).
 
 - **copy_dirty_state** — Copy uncommitted/staged/untracked files from main worktree. Reads `git status --porcelain` in *repo* and mirrors every dirty file into *wt_dir*. Files that exist in the main worktree are copied; files that were deleted are removed from *wt_dir*. The caller is expected to stage and commit the result as a baseline commit.<br/>`copy_dirty_state(repo: Path, wt_dir: Path) -> bool`
 
@@ -327,15 +323,15 @@ ______________________________________________________________________
   - `branch`: The branch name to delete.
   - `wt_dir`: The worktree directory to remove.
 
-- **cleanup_orphans** — Scan for orphaned `kiss/wt-*` branches and worktrees. Serialized under :func:`repo_lock`: the scan snapshots `git worktree list` and later deletes branches and rmtree's unregistered directories under `.kiss-worktrees/`. Without the lock, a worktree registered by a concurrent task start (`_try_setup_worktree`) after the snapshot would look like an orphan directory and be deleted out from under the active task.<br/>`cleanup_orphans(repo: Path) -> str`
-
-  - `repo`: Root of the git repository to scan.
-  - **Returns:** Summary of findings and any cleanup actions taken.
-
 **`repo_lock`** — Return a per-repo re-entrant lock for multi-step git operations. Concurrent tabs operating on the same main repository must serialize their checkout → stash → merge → pop sequences to prevent interleaving that could corrupt the working tree. The lock is an :class:`threading.RLock` (re-entrant) so a caller holding the lock for an outer multi-step operation (e.g. `_try_setup_worktree` releasing a previous worktree before creating a new one) can safely call inner helpers (`_do_merge`, `discard`) that re-acquire the same lock on the same thread. Cross-thread acquisitions still block as expected.<br/>`def repo_lock(repo: Path) -> threading.RLock`
 
 - `repo`: Git repo root path.
 - **Returns:** A :class:`threading.RLock` specific to the resolved repo path.
+
+**`strip_worktree_suffix`** — Return *path* with the `.kiss-worktrees/kiss_wt-<slug>[/...]` suffix removed, leaving the parent repository path. Worktree directories are ephemeral — they are deleted when the worktree is merged or discarded. Persisting a worktree path in long-lived storage (e.g. `task_history.extra.work_dir`) would leave dangling references the user-visible UI cannot resolve. Use this helper at every persistence boundary that records a `work_dir` for later display or filtering. Paths that do not contain a `<repo>/.kiss-worktrees/kiss_wt-*` segment are returned unchanged, including the empty string.<br/>`def strip_worktree_suffix(path: str) -> str`
+
+- `path`: An absolute or relative filesystem path string.
+- **Returns:** The parent-repo path string, or the unchanged input when the path is not inside a KISS worktree.
 
 ______________________________________________________________________
 
@@ -360,14 +356,5 @@ ______________________________________________________________________
 - **discard** — Throw away the task branch and worktree, checkout original. Every step is idempotent — safe to call multiple times. Acquires `repo_lock` to serialize against concurrent merge/release operations on the same repository.<br/>`discard() -> str`
 
   - **Returns:** Confirmation message (includes a warning if checkout to the original branch failed).
-
-- **merge_instructions** — Return human-readable merge/discard instructions.<br/>`merge_instructions() -> str`
-
-  - **Returns:** Multi-line string with merge and discard instructions.
-
-- **cleanup** — Scan for orphaned `kiss/wt-*` branches and worktrees.<br/>`cleanup(repo_root: Path | str) -> str`
-
-  - `repo_root`: Root of the git repository to scan.
-  - **Returns:** Summary of findings and any cleanup actions taken.
 
 ______________________________________________________________________

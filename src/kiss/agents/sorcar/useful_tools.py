@@ -26,26 +26,6 @@ from kiss.core.models.model import (
 logger = logging.getLogger(__name__)
 
 
-def _expand_pwd_prefix(file_path: str, work_dir: str | None) -> str:
-    """Expand a literal ``PWD/`` prefix to the agent's working directory.
-
-    The system prompt instructs the model to interpret ``PWD`` as the
-    current working directory, but models routinely pass it through as a
-    literal path component (e.g. ``PWD/SORCAR.md``).  This helper
-    rewrites such paths so the subsequent Read still works.
-    """
-    if file_path == "PWD":
-        return work_dir or os.getcwd()
-    if file_path.startswith("PWD/"):
-        base = work_dir or os.getcwd()
-        # Strip extra leading slashes (e.g. "PWD//etc/passwd"):
-        # os.path.join discards *base* when the second component is
-        # absolute, which would silently escape the working directory.
-        suffix = file_path[len("PWD/") :].lstrip("/")
-        return os.path.join(base, suffix) if suffix else base
-    return file_path
-
-
 def _stale_worktree_fallback(resolved: Path) -> Path | None:
     """If *resolved* lives under a now-deleted ``.kiss-worktrees/kiss_wt-*``
     directory, return the equivalent path with that worktree segment
@@ -441,12 +421,48 @@ class UsefulTools:
         ENTIRE output (and, on the streaming path, leak the exception
         out of the tool) even when the command itself succeeded.
 
+        Vanished-worktree fallback: if ``self.work_dir`` points at a
+        directory that no longer exists on disk (e.g. the per-task
+        ``.kiss-worktrees/kiss_wt-*`` worktree was torn down by a
+        concurrent cleanup, discard, or crashed merge between
+        ``RelentlessAgent`` sub-sessions), launching the subprocess
+        with that missing ``cwd`` would crash *every* Bash call with
+        ``FileNotFoundError: [Errno 2] No such file or directory``
+        before any output is produced.  In that case we transparently
+        fall back to the parent repository root (with the
+        ``.kiss-worktrees/kiss_wt-<slug>`` segment stripped) so the
+        agent can keep working from the user's main checkout instead
+        of dying on every command.  If even the fallback path does
+        not exist we drop ``cwd`` entirely and let the child inherit
+        the agent process's cwd.
+
         Args:
             command: The shell command to execute.
 
         Returns:
             The started subprocess.
         """
+        cwd: str | None = self.work_dir or None
+        env_work_dir: str | None = self.work_dir
+        if cwd is not None and not os.path.isdir(cwd):
+            fallback = _stale_worktree_fallback(Path(cwd))
+            if fallback is not None and fallback.is_dir():
+                logger.warning(
+                    "Bash work_dir %r vanished mid-task; "
+                    "falling back to parent repo root %r",
+                    cwd,
+                    str(fallback),
+                )
+                cwd = str(fallback)
+                env_work_dir = cwd
+            else:
+                logger.warning(
+                    "Bash work_dir %r vanished mid-task and no "
+                    "fallback parent exists; running without cwd",
+                    cwd,
+                )
+                cwd = None
+                env_work_dir = None
         return subprocess.Popen(
             **_popen_kwargs(command),
             stdout=subprocess.PIPE,
@@ -454,8 +470,8 @@ class UsefulTools:
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=_clean_env(self.work_dir),
-            cwd=self.work_dir or None,
+            env=_clean_env(env_work_dir),
+            cwd=cwd,
         )
 
     def _start_stop_monitor(
@@ -481,16 +497,27 @@ class UsefulTools:
         self,
         file_path: str,
         max_lines: int = 2000,
+        start_line: int = 1,
     ) -> str:
         """Read file contents.
 
         Args:
             file_path: Absolute path to file.
             max_lines: Maximum number of lines to return.
+            start_line: 1-indexed line at which to begin the returned
+                window.  ``start_line=1`` (the default) reads from the
+                top of the file and is backward-compatible.  Values
+                less than 1 are rejected; values beyond EOF return an
+                explicit sentinel rather than empty content so the
+                model is not misled into thinking the file is empty.
         """
+        if start_line < 1:
+            return (
+                f"Error: start_line must be >= 1 (got {start_line}); the "
+                f"parameter is 1-indexed."
+            )
         try:
-            expanded = _expand_pwd_prefix(file_path, self.work_dir)
-            expanded = _absolutize(expanded, self.work_dir)
+            expanded = _absolutize(file_path, self.work_dir)
             resolved = Path(expanded).resolve()
 
             # Active-worktree remap: if work_dir is inside a live
@@ -545,12 +572,17 @@ class UsefulTools:
                 return "(file is empty)"
 
             lines = text.splitlines(keepends=True)
-            if len(lines) > max_lines:
+            total = len(lines)
+            if start_line > total:
                 return (
-                    "".join(lines[:max_lines])
-                    + f"\n[truncated: {len(lines) - max_lines} more lines]"
+                    f"Error: start_line={start_line} is past EOF "
+                    f"(file has {total} line{'s' if total != 1 else ''})."
                 )
-            return text
+            window = lines[start_line - 1 : start_line - 1 + max_lines]
+            remaining = total - (start_line - 1) - len(window)
+            if remaining > 0:
+                return "".join(window) + f"\n[truncated: {remaining} more lines]"
+            return "".join(window)
         except Exception as e:
             logger.debug("Exception caught", exc_info=True)
             return f"Error: {e}"
@@ -607,8 +639,7 @@ class UsefulTools:
             content: The full content to write to the file.
         """
         try:
-            expanded = _expand_pwd_prefix(file_path, self.work_dir)
-            expanded = _absolutize(expanded, self.work_dir)
+            expanded = _absolutize(file_path, self.work_dir)
             resolved = Path(expanded).resolve()
             # Active-worktree remap: redirect parent-repo absolute paths
             # into the active worktree so writes never leak out of the
@@ -650,8 +681,7 @@ class UsefulTools:
             The output of the edit operation.
         """
         try:
-            expanded = _expand_pwd_prefix(file_path, self.work_dir)
-            expanded = _absolutize(expanded, self.work_dir)
+            expanded = _absolutize(file_path, self.work_dir)
             resolved = Path(expanded).resolve()
             # Active-worktree remap: redirect parent-repo absolute paths
             # into the active worktree so edits never leak out of the

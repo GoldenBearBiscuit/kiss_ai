@@ -40,9 +40,7 @@ _WRITER: socket.socket | None = None
 def _sock_path() -> Path:
     """Return the UDS path the bridge should connect to.
 
-    Reads the ``KISS_SORCAR_SOCK`` environment variable on every call
-    (so tests can repoint the bridge by setting an env var and calling
-    :func:`reset_for_tests`).
+    Reads the ``KISS_SORCAR_SOCK`` environment variable on every call.
     """
     env = os.environ.get("KISS_SORCAR_SOCK")
     return Path(env) if env else _DEFAULT_SOCK_PATH
@@ -100,7 +98,7 @@ def send_event(event: dict[str, Any]) -> None:
     _send_envelope({"type": "cliEvent", "event": event})
 
 
-def send_cli_task_start(task_id: int) -> None:
+def send_cli_task_start(task_id: str) -> None:
     """Announce that the CLI process has begun running *task_id*.
 
     The daemon records the task id in
@@ -109,10 +107,10 @@ def send_cli_task_start(task_id: int) -> None:
     to the live event stream and shown the blinking-green-circle
     "running" indicator in its tab title.
     """
-    _send_envelope({"type": "cliTaskStart", "taskId": int(task_id)})
+    _send_envelope({"type": "cliTaskStart", "taskId": str(task_id)})
 
 
-def send_cli_task_end(task_id: int) -> None:
+def send_cli_task_end(task_id: str) -> None:
     """Announce that the CLI process has finished running *task_id*.
 
     The daemon drops the task id from
@@ -120,21 +118,6 @@ def send_cli_task_end(task_id: int) -> None:
     ``status:running=false`` event to every subscribed webview so
     the blinking-green-circle indicator stops.
     """
-    _send_envelope({"type": "cliTaskEnd", "taskId": int(task_id)})
+    _send_envelope({"type": "cliTaskEnd", "taskId": str(task_id)})
 
 
-def reset_for_tests() -> None:
-    """Drop the cached UDS connection.
-
-    Called by tests between scenarios so a new daemon (bound to a
-    fresh temp UDS path) is contacted instead of a stale cached
-    socket from a previous test.
-    """
-    global _WRITER
-    with _LOCK:
-        if _WRITER is not None:
-            try:
-                _WRITER.close()
-            except OSError:
-                pass
-            _WRITER = None
