@@ -29,6 +29,8 @@ from pathlib import Path
 
 import pytest
 
+from kiss.agents.sorcar.cli_steering import _BOX_H
+
 pytestmark = pytest.mark.skipif(
     not hasattr(os, "fork"), reason="requires a POSIX pty",
 )
@@ -56,7 +58,7 @@ def test_sigcont_reanchors_scroll_region_and_redraws_box(
     tmp_path: Path,
 ) -> None:
     """After SIGCONT the box must re-emit DECSTBM and redraw itself."""
-    import pty
+    from kiss.tests.agents.sorcar._pty_helper import pty_spawn
 
     started = tmp_path / "started"
     kiss_home = tmp_path / ".kisshome"
@@ -95,10 +97,7 @@ sys.stdout.write("CHILD_DONE\\n")
 sys.stdout.flush()
 """
 
-    pid, fd = pty.fork()
-    if pid == 0:  # child: fresh interpreter attached to the PTY slave
-        os.execvp(sys.executable, [sys.executable, "-c", child_code])
-        os._exit(0)  # pragma: no cover - exec never returns
+    pid, fd = pty_spawn([sys.executable, "-c", child_code])
 
     try:
         deadline = time.time() + 30.0
@@ -112,7 +111,7 @@ sys.stdout.flush()
         os.kill(pid, signal.SIGCONT)
         after = _drain(fd, 2.0)
 
-        region = f"\x1b[1;{24 - 3}r"  # rows=24, _BOX_H=3
+        region = f"\x1b[1;{24 - _BOX_H}r"  # rows=24, _BOX_H bottom rows reserved
         assert region in after, (
             "SIGCONT did not re-anchor the scroll region / redraw the "
             f"steering box; post-resume output: {after!r}"
