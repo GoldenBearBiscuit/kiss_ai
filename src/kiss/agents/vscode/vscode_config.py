@@ -10,9 +10,12 @@ API key injection into shell RC files and the running environment.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import logging
+import sys
+
+if sys.platform != "win32":
+    import fcntl  # pragma: no cover
 import os
 import shlex
 import shutil
@@ -195,8 +198,11 @@ def save_config(data: dict[str, Any]) -> None:
     # service daemon persists ``last_model``) — without it, two daemons
     # that each read the same old file and replace it would drop one
     # another's keys.
-    with _config_lock, open(CONFIG_DIR / ".config.lock", "w") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
+    with _config_lock:
+        lock_file = None
+        if sys.platform != "win32":
+            lock_file = open(CONFIG_DIR / ".config.lock", "w")
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
         try:
             existing: dict[str, Any] = {}
             if CONFIG_PATH.exists():
@@ -220,7 +226,9 @@ def save_config(data: dict[str, Any]) -> None:
                 os.close(fd)
             os.replace(tmp, CONFIG_PATH)
         finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            if lock_file is not None:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+                lock_file.close()
 
 
 def _get_user_shell() -> str:
